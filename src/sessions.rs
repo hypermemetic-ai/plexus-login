@@ -221,6 +221,18 @@ impl Sessions {
         Self::build(ttl_secs, names, names.session_cookie_for(public_url), names.login_cookie_for(public_url))
     }
 
+    /// FRAME-21: sessions kept in a journal at `path` (the host names it:
+    /// menger's is `sessions.jsonl` beside its database), so a restart
+    /// signs no one out — loaded at open, every session that still stands.
+    ///
+    /// The testing surface's signature only (`tests/sessions_persist.rs`):
+    /// until the journal lands this is [`Sessions::new`], in memory, and the
+    /// path is unused.
+    pub fn open(path: impl AsRef<std::path::Path>, ttl_secs: i64, names: &LoginNames) -> std::io::Result<Self> {
+        let _ = path.as_ref();
+        Ok(Self::new(ttl_secs, names))
+    }
+
     fn build(ttl_secs: i64, names: &LoginNames, cookie: String, login_cookie: String) -> Self {
         Self {
             live: Mutex::new(Ending::new()),
