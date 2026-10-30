@@ -89,6 +89,35 @@ impl TokenStore {
         self.len() == 0
     }
 
+    /// FRAME-21: after a restart, the sessions our page started through
+    /// `backend` stand again (the journal kept them) but their tokens did
+    /// not. Each gets a revoke-only entry — no access or refresh token, the
+    /// backend's session id from the session's identity — so signing out
+    /// still ends it at the backend; it is never refreshed, so a revocation
+    /// made at the backend no longer ends it here. How many were re-seated.
+    pub fn reseat(&self, backend: &Arc<dyn IdentityBackend>) -> usize {
+        let mut n = 0;
+        for (key, ctx) in self.sessions.standing() {
+            if ctx.get_metadata_string("identity_backend").as_deref() != Some(backend.name()) || ctx.session_id.is_empty() {
+                continue;
+            }
+            let mut map = self.map.lock().unwrap();
+            if map.contains_key(&key) {
+                continue;
+            }
+            let tokens = TokenSet {
+                access: crate::identity::Secret(String::new()),
+                refresh: None,
+                session: Some(ctx.session_id.clone()),
+                expires_at: ctx.metadata.get("expires_at").and_then(Value::as_i64).unwrap_or(0),
+            };
+            let principal = ctx.principal().map(|p| p.to_string()).unwrap_or_default();
+            map.insert(key, Held { tokens, principal, backend: backend.clone() });
+            n += 1;
+        }
+        n
+    }
+
     /// The session signs out: its tokens dropped now, and its backend
     /// session ended off the request, retried a few times (logged).
     pub fn revoke_later(&self, session_key: &str) {
@@ -221,5 +250,43 @@ impl Continuation for AppContinuation {
 
     fn draw(&self, body: Body) -> page::Page {
         page::render(&self.chrome, body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::memory::{Memory, MemoryOptions};
+    use plexus_core::plexus::AuthContext;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn a_restart_reseats_each_page_session_revoke_only() {
+        // FRAME-21: the journal kept the session, not its tokens; sign-out
+        // must still reach the backend's session, and nothing refreshes.
+        let dir = std::env::temp_dir().join(format!("plexus-login-reseat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("sessions.jsonl");
+        let names = crate::LoginNames::for_app("toy");
+        let page = AuthContext::new("oidc:workos/u1".into(), "session_01".into(), vec![], json!({ "principal": "oidc:workos/u1", "identity_backend": "memory" }));
+        let agent = AuthContext::new("key:a".into(), "mgs".into(), vec![], json!({ "principal": "key:a" }));
+        {
+            let s = Sessions::open(&path, 3600, &names).unwrap();
+            s.create(page).unwrap();
+            s.mint(agent, 600).unwrap();
+        }
+        let sessions = Arc::new(Sessions::open(&path, 3600, &names).unwrap());
+        let tokens = TokenStore::new(sessions.clone());
+        let backend: Arc<dyn IdentityBackend> = Arc::new(Memory::new(MemoryOptions::default()));
+        assert_eq!(tokens.reseat(&backend), 1, "the page's session, not the agent's");
+        let (key, _) = sessions.standing().into_iter().find(|(_, c)| c.user_id == "oidc:workos/u1").unwrap();
+        let held = tokens.get(&key).expect("re-seated");
+        assert_eq!(held.tokens.session.as_deref(), Some("session_01"), "sign-out ends the backend's own session");
+        assert!(held.tokens.refresh.is_none() && held.tokens.access.0.is_empty(), "no secret came back");
+        assert_eq!(tokens.reseat(&backend), 0, "once");
+        let pass = tokens.refresh_due(i64::MAX / 2).await;
+        assert_eq!((pass.refreshed, pass.ended), (0, 0), "never refreshed, never ended for it");
+        assert!(sessions.alive(&key));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

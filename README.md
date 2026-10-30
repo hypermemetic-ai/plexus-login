@@ -324,39 +324,48 @@ A shell that mounts the routes itself (menger's `shell.rs`) takes
 
 `Sessions::new` and `Sessions::for_shell` keep the session table in memory:
 a restart signs everyone out — every browser lands on `/login`, every agent
-mints again. `Sessions::open(path, ttl, names)` and
-`Sessions::open_for_shell(path, ttl, names, public_url)` — or
-`LoginOptions::sessions_file` under `Wiring` — keep it in a journal at
-`path`, which the host names (menger: `sessions.jsonl` beside its
-database):
+mints again. `table.journaled(path)?` (`Sessions::for_shell(…).journaled(…)`
+is what `Wiring` builds when `LoginOptions::sessions_file` names a file;
+`Sessions::open(path, ttl, names)` is `new(…).journaled(path)`) keeps it in a
+journal at `path`, which the host names (menger: `<database>.sessions.jsonl`
+beside its database):
 
-- **What a row is.** JSON lines: `{"op":"start","key","ends","idles","ctx"}`
+- **What a row is.** JSON lines: `{"op":"start","key","ends","idles","seen","ctx"}`
   for every session started — a browser's (`create`) and an agent's minted
-  `mgs_…` token (`mint`) alike — and `{"op":"end","key"}` for every one
-  ended: sign-out by cookie or by key, idleness, the cap pushing one out.
-  `key` is the id's sha256, as the table keys it; the id itself is never
-  written, so a read of the file opens nothing.
-- **Written before it is handed out.** A row is written and fsynced before
-  `create` or `mint` answers; one that cannot be written is an error and no
-  session (`create` and `mint` return `io::Result`; the login page answers
-  503, `auth.login` an in-band error).
+  `mgs_…` token (`mint`) alike; `{"op":"touch","key","at"}` when a browser's
+  session is used, at most once an eighth of its idle time (at least a
+  second), so a restart keeps its idle clock to within that; and
+  `{"op":"end","key"}` for every one ended — sign-out by cookie or by key,
+  idleness, the cap pushing one out. `key` is the id's sha256, as the table
+  keys it; the id itself is never written, so a read of the file opens
+  nothing.
+- **Written before it is handed out.** A start row is written and fsynced
+  before `create` or `mint` answers; one that cannot be written is an error
+  and no session (`create` and `mint` return `io::Result`; the login page
+  answers 503, `auth.login` an in-band error). The table's own lock is never
+  held across a write: the journal's is taken first, then the table's.
 - **Loaded at open.** The rows are replayed in order: an ended or expired
-  session is dropped, a torn last line (a crash mid-write) is skipped, and
-  the file is rewritten to the live set. It is rewritten again whenever it
-  passes ten times the live set (at least 1,000 rows). A session's idle
-  clock starts again at the open.
-- **The file.** Made 0600, and its directory if missing; held under an
-  exclusive lock (`File::try_lock`) for the table's life: a second server
-  on the same file does not start, and says which file.
-- **What is not kept.** Sign-ins in flight (a code flow's state, a loopback
-  sign-in and its one-time code) stay in memory: one under way at a restart
-  fails closed — "start again" — and nothing is minted twice. Nor are the
-  identity backend's tokens (`app_session::TokenStore`: an access token and
-  a refresh token, secrets): after a restart, a session our own sign-in
-  page started **stands until its own expiry**, unrefreshed; signing out
-  ends it here but **no longer revokes it at the backend** (WorkOS's
-  session lingers to its own end); and a revocation **at the backend no
-  longer ends it** here.
+  session is dropped, a browser's session past its idle time since its last
+  recorded use ends when next asked, a torn last line (a crash mid-write) is
+  skipped, and the file is rewritten to the live set. It is rewritten again
+  whenever it passes ten times the live set (at least 1,000 rows): a new
+  file at 0600, fsynced, renamed into place, its directory fsynced.
+- **The file and its lock.** The journal is made 0600 (and its directory if
+  missing). Beside it, `<path>.lock` is held under an exclusive
+  `File::try_lock` for the table's life — a file of its own, because a lock
+  on the journal would stay with the old file once a compaction renames the
+  new one into place. A second server on the same file does not start, and
+  says which file.
+- **What is not kept.** Sign-ins in flight — a code flow's state, a loopback
+  sign-in and its one-time code, the sign-in page's enrolment and SSO flows
+  — stay in memory: one under way at a restart fails closed ("start
+  again"), and nothing is minted twice. Nor are the identity backend's
+  tokens (`app_session::TokenStore`: an access token and a refresh token,
+  secrets). After a restart each session our own sign-in page started is
+  re-seated revoke-only (`TokenStore::reseat`: the backend's session id is
+  the session's own `session_id`), so signing out still ends it at the
+  backend; but it is never refreshed, so **a revocation made at the backend
+  no longer ends it here** — it stands until its own expiry.
 
 ## The seam: `LoginAccess`
 

@@ -75,8 +75,8 @@ pub struct LoginOptions {
     /// (default [`crate::sessions::IDLE_SECS_DEFAULT`], 2 h; 0: never).
     pub session_idle_secs: i64,
     /// FRAME-21: where the session table is kept, so a restart signs no one
-    /// out ([`Sessions::open_for_shell`]: a journal, 0600, locked); `None`,
-    /// in memory.
+    /// out ([`Sessions::journaled`]: a journal, 0600, beside its lock);
+    /// `None`, in memory.
     pub sessions_file: Option<std::path::PathBuf>,
     /// `--require-login`: the shell's pages need a session.
     pub require: bool,
@@ -252,7 +252,7 @@ impl Wiring {
         let sockets = login::socket_urls(opts.ws_port, opts.public_url.as_deref());
         let carriers = login::boundary_at(&opts.providers, &sockets)?;
         let sessions = match &opts.sessions_file {
-            Some(path) => Sessions::open_for_shell(path, opts.session_ttl_secs, &opts.names, &public_url)?,
+            Some(path) => Sessions::for_shell(opts.session_ttl_secs, &opts.names, &public_url).journaled(path)?,
             None => Sessions::for_shell(opts.session_ttl_secs, &opts.names, &public_url),
         };
         let sessions = Arc::new(sessions.with_idle(opts.session_idle_secs));

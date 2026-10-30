@@ -216,6 +216,11 @@ impl<A: LoginAccess> Login<A> {
         let (signin, tokens) = match cfg.identity {
             Some(backend) => {
                 let tokens = TokenStore::new(sessions.clone());
+                // FRAME-21: the sessions a restart kept, revocable again.
+                let reseated = tokens.reseat(&backend);
+                if reseated > 0 {
+                    tracing::info!(sessions = reseated, backend = backend.name(), "sessions kept across the restart: sign-out ends them at the backend again; they are not refreshed");
+                }
                 let chrome = Chrome {
                     branding: cfg.branding,
                     title: cfg.title.to_string(),
