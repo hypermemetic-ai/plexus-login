@@ -200,7 +200,7 @@ async fn enrolling_needs_a_recent_sign_in() {
     a.wired.sessions.end(&cookie);
     let mut old = ctx.clone();
     old.metadata["auth_time"] = json!(now() - 3600);
-    let (id, _) = a.wired.sessions.create(old);
+    let (id, _) = a.wired.sessions.create(old).unwrap();
     b.jar.lock().unwrap().insert(a.wired.sessions.cookie_name().to_string(), id);
     let acct = b.get("/login/account").await;
     let r = b.post("/login/account/totp", &[("csrf", &acct.csrf())]).await;

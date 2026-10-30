@@ -33,8 +33,9 @@ plexus-login = "0.2"
   provider's token is verified in the shell, a session starts, and the
   browser gets an `HttpOnly; SameSite=Lax` session cookie. No script on any
   page can read a credential.
-- **Sessions** live in memory, keyed by a hash. They end at their expiry or
-  at sign-out, and a signed-out session's open sockets stop answering.
+- **Sessions** are keyed by a hash of their id. They end at their expiry or
+  at sign-out, and a signed-out session's open sockets stop answering. In
+  memory by default; kept in a journal, they survive a restart (below).
 - **The gate** is the upgrade's validator. It tries the session cookie
   first, then a minted `mgs_…` session token, then a provider's own
   credential. A connection with no credential is admitted into the
@@ -255,6 +256,7 @@ pub struct LoginOptions {
     pub public_url: Option<String>,      // --public-url (default http://127.0.0.1:<shell_port>)
     pub allowed_origins: Vec<String>,    // --allowed-origin
     pub session_ttl_secs: i64,           // default 12 h
+    pub sessions_file: Option<PathBuf>,  // FRAME-21: the sessions journal (None: in memory)
     pub require: bool,                   // --require-login
     pub page: bool,                      // a shell to serve the page on (false: --no-shell, stdio)
     pub title: &'static str,
@@ -317,6 +319,44 @@ off: there is no gate and no page, and nothing is refused.
 A shell that mounts the routes itself (menger's `shell.rs`) takes
 `wired.login`. For `--require-login` redirects it uses `Login::session`
 (who a request's cookie is), and for Host checks it uses `Login::hosts`.
+
+## Sessions that survive a restart (FRAME-21)
+
+`Sessions::new` and `Sessions::for_shell` keep the session table in memory:
+a restart signs everyone out — every browser lands on `/login`, every agent
+mints again. `Sessions::open(path, ttl, names)` and
+`Sessions::open_for_shell(path, ttl, names, public_url)` — or
+`LoginOptions::sessions_file` under `Wiring` — keep it in a journal at
+`path`, which the host names (menger: `sessions.jsonl` beside its
+database):
+
+- **What a row is.** JSON lines: `{"op":"start","key","ends","idles","ctx"}`
+  for every session started — a browser's (`create`) and an agent's minted
+  `mgs_…` token (`mint`) alike — and `{"op":"end","key"}` for every one
+  ended: sign-out by cookie or by key, idleness, the cap pushing one out.
+  `key` is the id's sha256, as the table keys it; the id itself is never
+  written, so a read of the file opens nothing.
+- **Written before it is handed out.** A row is written and fsynced before
+  `create` or `mint` answers; one that cannot be written is an error and no
+  session (`create` and `mint` return `io::Result`; the login page answers
+  503, `auth.login` an in-band error).
+- **Loaded at open.** The rows are replayed in order: an ended or expired
+  session is dropped, a torn last line (a crash mid-write) is skipped, and
+  the file is rewritten to the live set. It is rewritten again whenever it
+  passes ten times the live set (at least 1,000 rows). A session's idle
+  clock starts again at the open.
+- **The file.** Made 0600, and its directory if missing; held under an
+  exclusive lock (`File::try_lock`) for the table's life: a second server
+  on the same file does not start, and says which file.
+- **What is not kept.** Sign-ins in flight (a code flow's state, a loopback
+  sign-in and its one-time code) stay in memory: one under way at a restart
+  fails closed — "start again" — and nothing is minted twice. Nor are the
+  identity backend's tokens (`app_session::TokenStore`: an access token and
+  a refresh token, secrets): after a restart, a session our own sign-in
+  page started **stands until its own expiry**, unrefreshed; signing out
+  ends it here but **no longer revokes it at the backend** (WorkOS's
+  session lingers to its own end); and a revocation **at the backend no
+  longer ends it** here.
 
 ## The seam: `LoginAccess`
 

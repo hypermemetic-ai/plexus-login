@@ -394,7 +394,11 @@ impl<A: LoginAccess> Login<A> {
 
     /// A session for an identity, its cookies set on `r`.
     fn hand_over(&self, ctx: AuthContext, mut r: Response) -> Response {
-        let (id, expires) = self.sessions.create(ctx);
+        // FRAME-21: a session that could not be kept is not handed out.
+        let (id, expires) = match self.sessions.create(ctx) {
+            Ok(kept) => kept,
+            Err(e) => return sessions::not_kept(e),
+        };
         let max_age = (expires - sessions::now()).max(0);
         let (name, secure) = (self.sessions.cookie_name(), self.secure());
         let h = r.headers_mut();

@@ -189,7 +189,11 @@ pub struct AppContinuation {
 impl Continuation for AppContinuation {
     async fn signed_in(&self, who: SignedIn, backend: Arc<dyn IdentityBackend>, next: &str) -> Response {
         let principal = who.ctx.principal().map(|p| p.to_string()).unwrap_or_default();
-        let (id, expires) = self.sessions.create(who.ctx);
+        // FRAME-21: a session that could not be kept is not handed out.
+        let (id, expires) = match self.sessions.create(who.ctx) {
+            Ok(kept) => kept,
+            Err(e) => return sessions::not_kept(e),
+        };
         if let (Some(tokens), Some(key)) = (who.tokens, self.sessions.get(&id).and_then(|c| c.get_metadata_string(self.sessions.session_key()))) {
             self.tokens.insert(&key, Held { tokens, principal, backend });
             self.tokens.start();

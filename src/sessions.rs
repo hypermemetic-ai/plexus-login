@@ -17,8 +17,21 @@
 //! provider's own credential (synapse's `-t` token, a NIP-98 event, an
 //! agent's key proof) through the adapters' [`Carriers`].
 //!
-//! In memory for now: a restart signs everyone out. IDENTITY-18's G2 asks
-//! whether sessions should live in the database instead.
+//! FRAME-21: a table opened on a journal ([`Sessions::open`],
+//! [`Sessions::open_for_shell`]) survives a restart. Every session started
+//! is a JSON line — its key (the id's sha256, never the id), its end,
+//! whether it idles, and the stamped identity — written and fsynced before
+//! the id is handed out (a row that cannot be written: no session, an
+//! error); every ending by hand, by idleness or by the cap is a line too.
+//! Opening replays the lines (ended and expired rows dropped, a torn last
+//! line skipped) and rewrites the file to the live set; it is rewritten
+//! again whenever it passes ten times the live set (at least 1,000 rows).
+//! The file is 0600 and held under an exclusive lock: a second server on it
+//! does not start. [`Sessions::new`] is the in-memory table: a restart
+//! signs everyone out. What a session's sign-in page left with its identity
+//! backend ([`crate::app_session::TokenStore`]) is not kept: after a
+//! restart such a session stands until its own end, unrefreshed and
+//! unrevoked at the backend.
 //!
 //! ACCESS-29: every table here is bounded and kept by when its entries end
 //! ([`Ending`]): an insert drops what has ended and makes room in O(log n),
@@ -29,6 +42,8 @@
 //! and no page loaded with it.
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -76,6 +91,14 @@ fn hash(id: &str) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// FRAME-21: the answer when a session could not be kept (its journal
+/// refused the row): 503, and no cookie.
+pub fn not_kept(e: io::Error) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    tracing::error!("a session could not be kept: {e}");
+    (axum::http::StatusCode::SERVICE_UNAVAILABLE, [(axum::http::header::RETRY_AFTER, "5")], "Signing in is unavailable for a moment: your session could not be kept. Try again.").into_response()
+}
+
 /// A named cookie's value in a `Cookie` header.
 pub fn cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
     header.split(';').find_map(|pair| {
@@ -111,17 +134,21 @@ impl<V> Ending<V> {
         Self { map: HashMap::new(), by_end: BTreeSet::new(), seq: 0 }
     }
 
-    /// Keeps `v` under `key` until `ends`, `cap` entries at most.
-    fn insert(&mut self, key: String, v: V, ends: i64, cap: usize) {
+    /// Keeps `v` under `key` until `ends`, `cap` entries at most: the keys
+    /// it pushed out to make room (FRAME-21: a journal records them).
+    fn insert(&mut self, key: String, v: V, ends: i64, cap: usize) -> Vec<String> {
         self.purge(now());
         self.remove(&key);
+        let mut evicted = Vec::new();
         while self.map.len() >= cap.max(1) {
             let Some((_, _, k)) = self.by_end.pop_first() else { break };
             self.map.remove(&k);
+            evicted.push(k);
         }
         self.seq += 1;
         self.by_end.insert((ends, self.seq, key.clone()));
         self.map.insert(key, (v, ends, self.seq));
+        evicted
     }
 
     /// Drops every entry ended by `t`, from the front of the index.
@@ -153,7 +180,6 @@ impl<V> Ending<V> {
         self.remove(key).filter(|(_, e)| *e > now()).map(|(v, _)| v)
     }
 
-    #[cfg(test)]
     fn len(&self) -> usize {
         self.map.len()
     }
@@ -189,9 +215,123 @@ struct CliCode {
     ctx: AuthContext,
 }
 
+/// FRAME-21: one line of the journal.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum Row {
+    /// A session started: its key, its end, whether it idles, who.
+    Start { key: String, ends: i64, idles: bool, ctx: AuthContext },
+    /// A session ended (sign-out, idleness, the cap).
+    End { key: String },
+}
+
+impl Row {
+    fn line(&self) -> Vec<u8> {
+        let mut l = serde_json::to_vec(self).expect("a row serializes");
+        l.push(b'\n');
+        l
+    }
+}
+
+/// FRAME-21: where the journal's bytes go — a file, or (in a test) a sink
+/// that refuses.
+trait Sink: Send {
+    /// Appends `bytes` durably (written and fsynced).
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()>;
+    /// Replaces everything with `bytes`, durably and atomically.
+    fn rewrite(&mut self, bytes: &[u8]) -> io::Result<()>;
+}
+
+/// The journal's file, 0600, held under an exclusive lock for as long as
+/// the table lives.
+struct FileSink {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+fn open_0600(path: &Path, fresh: bool) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true).append(true).mode(0o600);
+    if fresh {
+        o.create_new(true);
+    } else {
+        o.create(true);
+    }
+    o.open(path)
+}
+
+fn lock(file: &std::fs::File, path: &Path) -> io::Result<()> {
+    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("{} is held by another server: one server keeps one sessions file", path.display()),
+        ),
+        std::fs::TryLockError::Error(e) => io::Error::new(e.kind(), format!("cannot lock {}: {e}", path.display())),
+    })
+}
+
+impl FileSink {
+    /// Opens (or makes) the file at `path` and locks it: the sink and what
+    /// the file held.
+    fn open(path: &Path) -> io::Result<(Self, Vec<u8>)> {
+        let ctx = |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", path.display()));
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(ctx)?;
+        }
+        let mut file = open_0600(path, false).map_err(ctx)?;
+        lock(&file, path)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(ctx)?;
+        }
+        let mut held = Vec::new();
+        file.read_to_end(&mut held).map_err(ctx)?;
+        Ok((Self { path: path.to_path_buf(), file }, held))
+    }
+}
+
+impl Sink for FileSink {
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file.write_all(bytes)?;
+        self.file.sync_data()
+    }
+
+    fn rewrite(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut tmp = self.path.clone().into_os_string();
+        tmp.push(".new");
+        let tmp = PathBuf::from(tmp);
+        let _ = std::fs::remove_file(&tmp);
+        let mut file = open_0600(&tmp, true)?;
+        lock(&file, &tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &self.path)?;
+        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        // The new file, locked before it took the name, is the journal now.
+        self.file = file;
+        Ok(())
+    }
+}
+
+/// FRAME-21: past this many rows, and ten times the live set, the journal
+/// is rewritten to the live set.
+const COMPACT_FLOOR: usize = 1_000;
+
+/// The journal: its sink and how many rows it holds.
+struct Journal {
+    sink: Box<dyn Sink>,
+    rows: usize,
+}
+
 /// The session table. See the module docs.
 pub struct Sessions {
     live: Mutex<Ending<Session>>,
+    /// FRAME-21: the journal, when the table was opened on one. Locked
+    /// only while `live` is held (live, then journal).
+    journal: Mutex<Option<Journal>>,
     pending: Mutex<Ending<Pending>>,
     /// AUTH-7: loopback sign-ins, by state.
     cli: Mutex<Ending<CliPending>>,
@@ -222,20 +362,108 @@ impl Sessions {
     }
 
     /// FRAME-21: sessions kept in a journal at `path` (the host names it:
-    /// menger's is `sessions.jsonl` beside its database), so a restart
-    /// signs no one out — loaded at open, every session that still stands.
-    ///
-    /// The testing surface's signature only (`tests/sessions_persist.rs`):
-    /// until the journal lands this is [`Sessions::new`], in memory, and the
-    /// path is unused.
-    pub fn open(path: impl AsRef<std::path::Path>, ttl_secs: i64, names: &LoginNames) -> std::io::Result<Self> {
-        let _ = path.as_ref();
-        Ok(Self::new(ttl_secs, names))
+    /// menger's is `sessions.jsonl` beside its database), so a restart signs
+    /// no one out — every session that still stands is loaded, and the file
+    /// is rewritten to them. The file is made 0600 and locked: a second
+    /// table (another server) on it is refused, naming it.
+    pub fn open(path: impl AsRef<Path>, ttl_secs: i64, names: &LoginNames) -> io::Result<Self> {
+        Self::new(ttl_secs, names).journaled(path.as_ref())
+    }
+
+    /// [`Sessions::for_shell`], kept in a journal at `path`
+    /// ([`Sessions::open`]).
+    pub fn open_for_shell(path: impl AsRef<Path>, ttl_secs: i64, names: &LoginNames, public_url: &str) -> io::Result<Self> {
+        Self::for_shell(ttl_secs, names, public_url).journaled(path.as_ref())
+    }
+
+    fn journaled(self, path: &Path) -> io::Result<Self> {
+        let (sink, held) = FileSink::open(path)?;
+        self.replay(&held, path);
+        let me = self.with_sink(Box::new(sink));
+        me.compact().map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        Ok(me)
+    }
+
+    /// The rows in `held`, in order, into the table: a start that has not
+    /// ended, an end. A line that is not a row (a torn last write) is
+    /// skipped.
+    fn replay(&self, held: &[u8], path: &Path) {
+        let mut live = self.live.lock().unwrap();
+        let t = now();
+        for line in held.split(|b| *b == b'\n').filter(|l| !l.iter().all(u8::is_ascii_whitespace)) {
+            match serde_json::from_slice::<Row>(line) {
+                Ok(Row::Start { key, ends, idles, ctx }) if ends > t => {
+                    live.insert(key, Session { ctx, idles, seen: t }, ends, MAX_LIVE);
+                }
+                Ok(Row::Start { .. }) => {}
+                Ok(Row::End { key }) => {
+                    live.remove(&key);
+                }
+                Err(e) => tracing::warn!(file = %path.display(), "a sessions row that does not read is skipped: {e}"),
+            }
+        }
+    }
+
+    fn with_sink(self, sink: Box<dyn Sink>) -> Self {
+        *self.journal.lock().unwrap() = Some(Journal { sink, rows: 0 });
+        self
+    }
+
+    /// Rewrites the journal to the live set.
+    fn compact(&self) -> io::Result<()> {
+        let mut live = self.live.lock().unwrap();
+        self.compact_locked(&mut live)
+    }
+
+    fn compact_locked(&self, live: &mut Ending<Session>) -> io::Result<()> {
+        let mut journal = self.journal.lock().unwrap();
+        let Some(j) = journal.as_mut() else { return Ok(()) };
+        live.purge(now());
+        let mut bytes = Vec::new();
+        for (ends, _, key) in &live.by_end {
+            let (s, _, _) = &live.map[key];
+            bytes.extend(Row::Start { key: key.clone(), ends: *ends, idles: s.idles, ctx: s.ctx.clone() }.line());
+        }
+        j.sink.rewrite(&bytes)?;
+        j.rows = live.len();
+        Ok(())
+    }
+
+    /// Writes `rows` to the journal, if there is one; past ten times the
+    /// live set, rewrites it. Called with `live` held.
+    fn record(&self, live: &mut Ending<Session>, rows: &[Row]) -> io::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let crossed = {
+            let mut journal = self.journal.lock().unwrap();
+            let Some(j) = journal.as_mut() else { return Ok(()) };
+            let bytes: Vec<u8> = rows.iter().flat_map(Row::line).collect();
+            j.sink.append(&bytes)?;
+            j.rows += rows.len();
+            j.rows > (live.len() * 10).max(COMPACT_FLOOR)
+        };
+        if crossed {
+            if let Err(e) = self.compact_locked(live) {
+                tracing::error!("the sessions journal could not be compacted: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Records sessions that ended; an ending is never undone, so a row
+    /// that cannot be written is logged.
+    fn record_ends(&self, live: &mut Ending<Session>, keys: Vec<String>) {
+        let rows: Vec<Row> = keys.into_iter().map(|key| Row::End { key }).collect();
+        if let Err(e) = self.record(live, &rows) {
+            tracing::error!("a session's end could not be written to the journal (it may stand again after a restart): {e}");
+        }
     }
 
     fn build(ttl_secs: i64, names: &LoginNames, cookie: String, login_cookie: String) -> Self {
         Self {
             live: Mutex::new(Ending::new()),
+            journal: Mutex::new(None),
             pending: Mutex::new(Ending::new()),
             cli: Mutex::new(Ending::new()),
             codes: Mutex::new(Ending::new()),
@@ -280,26 +508,33 @@ impl Sessions {
     /// Starts a session for an identity a provider proved: the cookie value
     /// to set and when it ends. The identity is stamped with the session's
     /// key and expiry, so a call can ask whether it still stands.
-    pub fn create(&self, ctx: AuthContext) -> (String, i64) {
+    /// FRAME-21: on a journal, the session is written before it is handed
+    /// out; a row that cannot be written is an error and no session.
+    pub fn create(&self, ctx: AuthContext) -> io::Result<(String, i64)> {
         self.start(random_token(), ctx, self.ttl_secs, true)
     }
 
     /// IDENTITY-42: mints a session token (`mgs_…`) for an identity, lasting
     /// `ttl_secs`: the token and when it ends. Kept hashed, as a cookie's
     /// session is; it ends at its expiry or [`Sessions::end_key`].
-    pub fn mint(&self, ctx: AuthContext, ttl_secs: i64) -> (String, i64) {
+    /// FRAME-21: written before it is handed out, as [`Sessions::create`].
+    pub fn mint(&self, ctx: AuthContext, ttl_secs: i64) -> io::Result<(String, i64)> {
         self.start(format!("{TOKEN_PREFIX}{}", random_token()), ctx, ttl_secs, false)
     }
 
-    fn start(&self, id: String, mut ctx: AuthContext, ttl_secs: i64, idles: bool) -> (String, i64) {
+    fn start(&self, id: String, mut ctx: AuthContext, ttl_secs: i64, idles: bool) -> io::Result<(String, i64)> {
         let key = hash(&id);
         let expires = now() + ttl_secs;
         if let Some(meta) = ctx.metadata.as_object_mut() {
             meta.insert(self.names.session_key.clone(), key.clone().into());
             meta.insert("expires_at".into(), expires.into());
         }
-        self.live.lock().unwrap().insert(key, Session { ctx, idles, seen: now() }, expires, MAX_LIVE);
-        (id, expires)
+        let mut live = self.live.lock().unwrap();
+        // FRAME-21: durable before it exists.
+        self.record(&mut live, &[Row::Start { key: key.clone(), ends: expires, idles, ctx: ctx.clone() }])?;
+        let evicted = live.insert(key, Session { ctx, idles, seen: now() }, expires, MAX_LIVE);
+        self.record_ends(&mut live, evicted);
+        Ok((id, expires))
     }
 
     /// The session under `key` while it stands — before its expiry and, a
@@ -311,6 +546,7 @@ impl Sessions {
         let s = live.get_mut(key)?;
         if s.idles && self.idle_secs > 0 && t - s.seen > self.idle_secs {
             live.remove(key);
+            self.record_ends(&mut live, vec![key.to_string()]);
             return None;
         }
         s.seen = t;
@@ -325,13 +561,16 @@ impl Sessions {
     /// Ends a session (sign-out). Its sockets stop answering on their next
     /// call ([`Sessions::alive`]).
     pub fn end(&self, id: &str) {
-        self.live.lock().unwrap().remove(&hash(id));
+        self.end_key(&hash(id));
     }
 
     /// IDENTITY-42: ends the session whose key (the hash its identity
     /// carries under [`Sessions::session_key`]) this is; whether it stood.
     pub fn end_key(&self, key: &str) -> bool {
-        self.live.lock().unwrap().take(key).is_some()
+        let mut live = self.live.lock().unwrap();
+        let Some((_, ends)) = live.remove(key) else { return false };
+        self.record_ends(&mut live, vec![key.to_string()]);
+        ends > now()
     }
 
     /// Whether the session a connection's identity names still stands.
@@ -501,7 +740,7 @@ mod tests {
     #[test]
     fn a_session_stands_until_it_ends() {
         let s = Sessions::new(3600, &names());
-        let (id, expires) = s.create(alice());
+        let (id, expires) = s.create(alice()).unwrap();
         let ctx = s.get(&id).expect("signed in");
         assert_eq!(ctx.user_id, "alice");
         assert_eq!(ctx.metadata["expires_at"], expires);
@@ -516,7 +755,7 @@ mod tests {
     #[test]
     fn an_expired_session_is_nobody() {
         let s = Sessions::new(-1, &names());
-        let (id, _) = s.create(alice());
+        let (id, _) = s.create(alice()).unwrap();
         assert!(s.get(&id).is_none());
     }
 
@@ -535,7 +774,7 @@ mod tests {
         assert_eq!((s.cookie_name(), s.login_cookie_name(), s.session_key()), ("menger_session_4456", "menger_login_4456", "menger_session"));
         let s = Sessions::for_shell(3600, &LoginNames::for_app("toy"), "https://toy.example");
         assert_eq!((s.cookie_name(), s.login_cookie_name(), s.session_key()), ("__Host-toy_session", "__Secure-toy_login", "toy_session"));
-        let (id, _) = s.create(alice());
+        let (id, _) = s.create(alice()).unwrap();
         assert!(s.get(&id).unwrap().metadata["toy_session"].is_string(), "stamped under the app's key");
     }
 
@@ -571,8 +810,8 @@ mod tests {
     fn a_browser_session_unused_past_its_idle_time_ends_and_a_minted_token_does_not() {
         // ACCESS-29 (ACCESS-4 L2).
         let s = Sessions::new(3600, &names()).with_idle(60);
-        let (id, _) = s.create(alice());
-        let (token, _) = s.mint(alice(), 3600);
+        let (id, _) = s.create(alice()).unwrap();
+        let (token, _) = s.mint(alice(), 3600).unwrap();
         let key = s.get(&id).unwrap().metadata["menger_session"].as_str().unwrap().to_string();
         let minted = s.get(&token).unwrap().metadata["menger_session"].as_str().unwrap().to_string();
         assert!(s.alive(&key), "used: it stands");
@@ -583,7 +822,7 @@ mod tests {
         assert!(!s.alive(&key) && s.get(&id).is_none(), "idle: ended");
         assert!(s.alive(&minted) && s.get(&token).is_some(), "a minted token keeps only its expiry");
         let off = Sessions::new(3600, &names()).with_idle(0);
-        let (id, _) = off.create(alice());
+        let (id, _) = off.create(alice()).unwrap();
         let key = off.get(&id).unwrap().metadata["menger_session"].as_str().unwrap().to_string();
         off.live.lock().unwrap().get_mut(&key).unwrap().seen -= 3000;
         assert!(off.get(&id).is_some(), "0: no idle end");
@@ -592,7 +831,7 @@ mod tests {
     #[test]
     fn asking_after_a_session_keeps_it_in_use() {
         let s = Sessions::new(3600, &names()).with_idle(60);
-        let (id, _) = s.create(alice());
+        let (id, _) = s.create(alice()).unwrap();
         let key = s.get(&id).unwrap().metadata["menger_session"].as_str().unwrap().to_string();
         s.live.lock().unwrap().get_mut(&key).unwrap().seen -= 50;
         assert!(s.alive(&key), "an open socket's ask is a use");
@@ -603,7 +842,7 @@ mod tests {
     #[tokio::test]
     async fn the_gate_reads_only_its_own_cookie() {
         let s = Arc::new(Sessions::for_shell(3600, &names(), "http://127.0.0.1:4456"));
-        let (id, _) = s.create(alice());
+        let (id, _) = s.create(alice()).unwrap();
         let gate = Gate::new(s.clone(), None);
         assert!(gate.validate(&format!("menger_session_4451=x; menger_session_4456={id}")).await.is_some());
         assert!(gate.validate(&format!("menger_session={id}")).await.is_none(), "another server's name is not ours");
@@ -612,7 +851,7 @@ mod tests {
     #[tokio::test]
     async fn a_minted_token_opens_as_a_bearer_or_the_access_token_cookie_until_it_ends() {
         let s = Arc::new(Sessions::new(3600, &names()));
-        let (token, expires) = s.mint(alice(), 60);
+        let (token, expires) = s.mint(alice(), 60).unwrap();
         assert!(token.starts_with("mgs_") && token.len() >= 47, "{token}");
         assert!(expires <= now() + 60);
         let gate = Gate::new(s.clone(), None);
@@ -624,7 +863,7 @@ mod tests {
         assert!(s.end_key(&key));
         assert!(gate.validate(&token).await.is_none(), "ended");
         assert!(!s.end_key(&key), "once");
-        let (old, _) = s.mint(alice(), -1);
+        let (old, _) = s.mint(alice(), -1).unwrap();
         assert!(gate.validate(&old).await.is_none(), "expired");
     }
 
@@ -654,6 +893,39 @@ mod tests {
         }
     }
 
+    /// FRAME-21: a journal that refuses its row.
+    struct Refusing;
+
+    impl Sink for Refusing {
+        fn append(&mut self, _: &[u8]) -> io::Result<()> {
+            Err(io::Error::other("the disk is full"))
+        }
+        fn rewrite(&mut self, _: &[u8]) -> io::Result<()> {
+            Err(io::Error::other("the disk is full"))
+        }
+    }
+
+    #[test]
+    fn a_session_whose_row_cannot_be_written_is_not_handed_out() {
+        let s = Sessions::new(3600, &names()).with_sink(Box::new(Refusing));
+        let err = s.create(alice()).expect_err("no row, no session");
+        assert!(err.to_string().contains("disk is full"), "{err}");
+        assert!(s.mint(alice(), 60).is_err());
+        assert_eq!(s.live.lock().unwrap().len(), 0, "nothing stands that the journal does not hold");
+    }
+
+    #[test]
+    fn a_second_table_on_one_journal_is_refused_naming_it() {
+        let dir = std::env::temp_dir().join(format!("plexus-login-lock-{}", std::process::id()));
+        let path = dir.join("sessions.jsonl");
+        let first = Sessions::open(&path, 3600, &names()).expect("the first opens");
+        let err = Sessions::open(&path, 3600, &names()).err().expect("the second is refused");
+        assert!(err.to_string().contains(&path.display().to_string()) && err.to_string().contains("another server"), "{err}");
+        drop(first);
+        assert!(Sessions::open(&path, 3600, &names()).is_ok(), "free again once the first is gone");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn ids_are_random_and_long() {
         let (a, b) = (random_token(), random_token());
@@ -664,7 +936,7 @@ mod tests {
     #[tokio::test]
     async fn the_gate_takes_the_session_cookie_among_others() {
         let s = Arc::new(Sessions::new(3600, &names()));
-        let (id, _) = s.create(alice());
+        let (id, _) = s.create(alice()).unwrap();
         let gate = Gate::new(s.clone(), None);
         assert!(gate.validate(&format!("theme=dark; menger_session={id}")).await.is_some());
         assert!(gate.validate("menger_session=forged").await.is_none());

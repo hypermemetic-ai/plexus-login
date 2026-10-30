@@ -180,11 +180,12 @@ impl SimpleAccess {
             .clone()
     }
 
-    fn start(&self, ctx: &AuthContext, meta: serde_json::Map<String, Value>, ttl_secs: u64, shown: Vec<String>) -> Session {
+    fn start(&self, ctx: &AuthContext, meta: serde_json::Map<String, Value>, ttl_secs: u64, shown: Vec<String>) -> Result<Session, String> {
         let principal = principal_of(ctx);
         let minted = AuthContext::new(ctx.user_id.clone(), "mgs".into(), ctx.roles.clone(), Value::Object(meta));
-        let (token, expires_at) = self.0.sessions.mint(minted, ttl_secs.clamp(1, MINT_TTL_MAX_SECS) as i64);
-        Session { token, principal, agent: ctx.get_metadata_string("agent"), name: ctx.get_metadata_string("name"), expires_at, ceiling: shown }
+        // FRAME-21: a session that could not be kept is not handed out.
+        let (token, expires_at) = self.0.sessions.mint(minted, ttl_secs.clamp(1, MINT_TTL_MAX_SECS) as i64).map_err(|e| format!("the session could not be kept: {e}"))?;
+        Ok(Session { token, principal, agent: ctx.get_metadata_string("agent"), name: ctx.get_metadata_string("name"), expires_at, ceiling: shown })
     }
 
     fn membership(principal: &str, role: SimpleRole) -> Result<Membership, String> {
@@ -291,7 +292,7 @@ impl LoginAccess for SimpleAccess {
         if !layers.is_empty() {
             meta.insert(CEILING_KEY.into(), layers.into_iter().map(Value::from).collect::<Vec<_>>().into());
         }
-        Ok(self.start(ctx, meta, ttl, shown))
+        self.start(ctx, meta, ttl, shown)
     }
 
     fn mint_for(&self, ctx: AuthContext, ttl_secs: u64) -> Result<Session, String> {
@@ -302,7 +303,7 @@ impl LoginAccess for SimpleAccess {
             .map(|o| o.iter().filter(|(k, _)| *k != key && *k != "expires_at" && *k != CEILING_KEY).map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
         meta.insert("principal".into(), principal_of(&ctx).into());
-        Ok(self.start(&ctx, meta, ttl_secs, Vec::new()))
+        self.start(&ctx, meta, ttl_secs, Vec::new())
     }
 
     fn ask_access(&self, ctx: &AuthContext) -> Result<Waiting, String> {
