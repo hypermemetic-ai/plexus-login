@@ -23,7 +23,7 @@
 //! `X-Forwarded-For` arriving from a peer that is not trusted is logged
 //! once, loudly: a proxy is in front and is not named. The peer comes from axum's `ConnectInfo<SocketAddr>`: serve the
 //! router with `into_make_service_with_connect_info::<SocketAddr>()`
-//! (plexus-shell's `serve_on` does). Without it there is no peer, and the
+//! (plexus-webapp's `serve_on` does). Without it there is no peer, and the
 //! throttles share one bucket for every unknown client.
 
 use std::net::{IpAddr, SocketAddr};

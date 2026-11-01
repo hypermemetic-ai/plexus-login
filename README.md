@@ -502,7 +502,7 @@ error.
 
 Serve the router with the peer's address, so the throttles see who asks:
 `axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())`
-(plexus-shell's `serve_on` does). Without it every unknown client shares one
+(plexus-webapp's `serve_on` does). Without it every unknown client shares one
 bucket. Behind an edge, name it with `trusted_proxies`.
 
 ## 0.2.0
@@ -523,9 +523,8 @@ out with a strict CSP.
 
 ## Build and test
 
-A repository and cargo workspace of its own. A checkout builds against the
-plexus 0.6 line by sibling path: `../plexus-core`, `../plexus-transport`
-and `../plexus-auth-core` beside this repository.
+A repository and cargo workspace of its own. A checkout builds alone,
+against the plexus 0.7 line from crates.io.
 
 ```sh
 cargo test --workspace                     # the unit tests and tests/ (the sign-in flows, the toy)
