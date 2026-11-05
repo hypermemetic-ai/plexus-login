@@ -310,7 +310,7 @@ async fn an_issuer_without_the_role_is_refused() {
 
     let admin_code = call(&alice, "invites.issue", json!({ "role": "admin" })).await;
     assert_eq!(admin_code[0]["type"], "error", "she does not hold admin: {admin_code}");
-    assert!(admin_code[0]["message"].as_str().unwrap().contains("do not hold"), "{admin_code}");
+    assert!(admin_code[0]["message"].as_str().unwrap().contains("never grants admin"), "{admin_code}");
     let viewer = call(&alice, "invites.issue", json!({ "role": "viewer" })).await;
     assert_eq!(viewer[0]["type"], "error", "nor viewer: {viewer}");
     let nonsense = call(&alice, "invites.issue", json!({ "role": "owner" })).await;
@@ -453,4 +453,16 @@ fn codes_sit_beside_our_own_sign_in_page_and_its_emailed_codes() {
     let (wired, _) = wire(opts);
     // Its emailed codes are POST /login/code; a sign-in code is /login/invite.
     assert!(wired.router().is_some());
+}
+
+/// IDENTITY-50: not even an admin issues a code for admin.
+#[tokio::test]
+async fn no_code_grants_admin_whoever_issues_it() {
+    let toy = toy(|_| {}).await;
+    let admin = toy.socket(&toy.signed_in(ADMIN, "root")).await;
+    let got = call(&admin, "invites.issue", json!({ "role": "admin" })).await;
+    assert_eq!(got[0]["type"], "error", "{got}");
+    assert!(got[0]["message"].as_str().unwrap().contains("never grants admin"), "{got}");
+    let viewer = call(&admin, "invites.issue", json!({ "role": "viewer" })).await;
+    assert_eq!(viewer[0]["type"], "invite", "{viewer}");
 }
