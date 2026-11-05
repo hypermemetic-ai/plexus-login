@@ -344,7 +344,12 @@ impl LoginAccess for SimpleAccess {
         if scope != "*" {
             return Err(format!("`{scope}`: roles here are global — the scope is `*`"));
         }
-        if role != ADMIN && self.0.roles.grants(&RoleName::new(role)).is_none() {
+        // IDENTITY-50 (owner, 2026-11-05: "don't grant admin then"): a code
+        // never hands out admin — admin is `--admin` or `auth.grant`, by name.
+        if role == ADMIN {
+            return Err("a code never grants admin: an admin is named (--admin) or granted (auth.grant), never invited".into());
+        }
+        if self.0.roles.grants(&RoleName::new(role)).is_none() {
             return Err(format!("no role `{role}` here: auth.roles lists them"));
         }
         let held = issuer.principal().map(|p| self.0.memberships.held(&p)).unwrap_or_default();
