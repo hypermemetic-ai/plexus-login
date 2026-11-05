@@ -36,7 +36,7 @@ use plexus_auth_core::identity::Principal;
 use plexus_auth_core::RoleName;
 use plexus_core::plexus::{
     AuthBackend, AuthContext, AuthSetup, Ceiling, DynamicHub, Membership, MembershipStore, Memberships, MemoryMemberships,
-    MemoryRoles, Resolve, ScopeRef, Session, Waiting, ADMIN, CEILING_KEY,
+    MemoryRoles, Resolve, Roles, ScopeRef, Session, Waiting, ADMIN, CEILING_KEY,
 };
 use serde_json::Value;
 
@@ -336,6 +336,45 @@ impl LoginAccess for SimpleAccess {
 
     fn session_key(&self) -> Option<&str> {
         Some(self.0.sessions.session_key())
+    }
+
+    /// IDENTITY-49: a role the role table knows (or admin), on `*`, held by
+    /// the issuer — an admin holds every one.
+    fn invite_check(&self, issuer: &AuthContext, role: &str, scope: &str) -> Result<(), String> {
+        if scope != "*" {
+            return Err(format!("`{scope}`: roles here are global — the scope is `*`"));
+        }
+        if role != ADMIN && self.0.roles.grants(&RoleName::new(role)).is_none() {
+            return Err(format!("no role `{role}` here: auth.roles lists them"));
+        }
+        let held = issuer.principal().map(|p| self.0.memberships.held(&p)).unwrap_or_default();
+        if held.iter().any(|m| m.role.as_str() == ADMIN || m.role.as_str() == role) {
+            Ok(())
+        } else {
+            Err(format!("you do not hold `{role}`: a code hands out only a role its issuer holds"))
+        }
+    }
+
+    fn invite_grant(&self, principal: &str, role: &str, _scope: &str) -> Result<(), String> {
+        let m = Membership {
+            principal: principal.parse().map_err(|e| format!("`{principal}` is not a principal ({e})"))?,
+            role: RoleName::new(role),
+            scope: ScopeRef::Everywhere,
+        };
+        // In memory: the future is ready at once.
+        futures::executor::block_on(self.0.memberships.grant(m)).map_err(|e| e.to_string())?;
+        self.0.waiting.lock().unwrap_or_else(|p| p.into_inner()).remove(principal);
+        Ok(())
+    }
+
+    fn invite_revoke(&self, principal: &str, role: &str, _scope: &str) -> Result<(), String> {
+        let who: Principal = principal.parse().map_err(|e| format!("`{principal}` is not a principal ({e})"))?;
+        futures::executor::block_on(self.0.memberships.revoke(&who, Some(&RoleName::new(role)), &ScopeRef::Everywhere)).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn is_admin(&self, ctx: &AuthContext) -> bool {
+        ctx.principal().is_some_and(|p| self.0.memberships.held(&p).iter().any(|m| m.role.as_str() == ADMIN))
     }
 }
 

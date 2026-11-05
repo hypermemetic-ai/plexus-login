@@ -79,6 +79,43 @@ pub trait LoginAccess: Clone + Send + Sync + 'static {
     /// `None`: the rules keep no sessions (login off), so no identity
     /// carries one.
     fn session_key(&self) -> Option<&str>;
+
+    // ── IDENTITY-49: sign-in codes ([`crate::invites`]) ──
+    //
+    // Each has a default that takes no codes, so rules written before them
+    // keep compiling and refuse every code until they say otherwise.
+
+    /// Whether `issuer` may hand out `role` on `scope` (already through
+    /// [`LoginAccess::scope_of`]) in a sign-in code: the role is one the
+    /// service knows and the issuer holds it there (an admin holds every
+    /// one). `Err`: why not, in words for the issuer.
+    fn invite_check(&self, issuer: &AuthContext, role: &str, scope: &str) -> Result<(), String> {
+        let _ = (issuer, role, scope);
+        Err("this service's rules take no sign-in codes".into())
+    }
+
+    /// Grants `principal` `role` on `scope` because a sign-in code said so —
+    /// at its redemption, and again at every start for the grants a code
+    /// made (rules that forget at a restart, as [`crate::simple::SimpleAccess`]
+    /// does, get them back). Synchronous: called with the code's journal held.
+    fn invite_grant(&self, principal: &str, role: &str, scope: &str) -> Result<(), String> {
+        let _ = (principal, role, scope);
+        Err("this service's rules take no sign-in codes".into())
+    }
+
+    /// Takes back a grant [`LoginAccess::invite_grant`] made (a code withdrawn
+    /// with `sign_out`, or a redemption whose record could not be kept).
+    fn invite_revoke(&self, principal: &str, role: &str, scope: &str) -> Result<(), String> {
+        let _ = (principal, role, scope);
+        Err("this service's rules take no sign-in codes".into())
+    }
+
+    /// Whether `ctx` is an admin everywhere: who sees and withdraws every
+    /// code, not only their own.
+    fn is_admin(&self, ctx: &AuthContext) -> bool {
+        let _ = ctx;
+        false
+    }
 }
 
 /// What the login page says of the app it signs in to.

@@ -126,6 +126,17 @@ pub struct LoginOptions {
     /// DIST-14: one-time sign-in links ([`crate::once`]) — the app's, on a
     /// shell it serves on loopback alone; none elsewhere.
     pub once: Option<Arc<dyn crate::once::OnceLinks>>,
+    /// IDENTITY-49: sign-in codes ([`crate::invites`]) — an admin issues
+    /// one for a role (`invites.issue`, [`Wired::invites_activation`]) and
+    /// anyone redeems it on the login page, from any network. Needs the
+    /// page (a provider, `page`).
+    pub invites: bool,
+    /// IDENTITY-49: where the codes are kept, so a restart keeps them, their
+    /// counts and the grants they made (a journal, 0600, beside its lock).
+    /// Setting it turns codes on. With codes on and none named, beside
+    /// `sessions_file` when there is one ([`crate::invites::beside`]),
+    /// else in memory.
+    pub invites_file: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for LoginOptions {
@@ -172,6 +183,8 @@ impl LoginOptions {
             shell_loopback: true,
             workos_key: None,
             once: None,
+            invites: false,
+            invites_file: None,
         }
     }
 
@@ -244,6 +257,10 @@ impl Wiring {
                  or `none` when people connect to it directly — without it, every visitor behind a proxy is one client to the throttles"
             );
         }
+        // IDENTITY-49: a guest's principal is `oidc:invite/…`; no provider may take that name.
+        if opts.providers.iter().any(|p| p.name() == crate::invites::GUEST_PROVIDER) {
+            anyhow::bail!("--auth-provider {}: that name is the sign-in codes' guests'", crate::invites::GUEST_PROVIDER);
+        }
         if opts.require && opts.providers.is_empty() && opts.identity.is_none() {
             anyhow::bail!("--require-login needs at least one --auth-provider to log in with");
         }
@@ -294,6 +311,23 @@ impl Wiring {
     pub fn finish<A: LoginAccess>(self, access: A, dev: Option<DevLogin<A>>) -> anyhow::Result<Wired<A>> {
         let Self { opts, sessions, carriers, public_url, shell_origins } = self;
         let login_on = !opts.providers.is_empty() || opts.identity.is_some();
+        // IDENTITY-49: sign-in codes, kept where the host said, their grants
+        // given back to the rules.
+        let invites = if opts.invites || opts.invites_file.is_some() {
+            anyhow::ensure!(login_on && opts.page, "sign-in codes are redeemed on the login page: they need a provider and the page");
+            let file = opts.invites_file.clone().or_else(|| opts.sessions_file.as_deref().map(crate::invites::beside));
+            let invites = match &file {
+                Some(path) => crate::invites::Invites::new(&public_url).journaled(path)?,
+                None => crate::invites::Invites::new(&public_url),
+            };
+            let restored = invites.restore(&access);
+            if restored > 0 {
+                tracing::info!(grants = restored, "sign-in codes: the grants they made are given back");
+            }
+            Some(Arc::new(invites))
+        } else {
+            None
+        };
         let login = if login_on && opts.page {
             Some(Arc::new(Login::new(
                 LoginConfig {
@@ -317,7 +351,7 @@ impl Wiring {
                     limits: opts.limits,
                 },
                 sessions.clone(),
-            )?.with_once(opts.once.clone())))
+            )?.with_once(opts.once.clone()).with_invites(invites.clone())))
         } else {
             None
         };
@@ -341,7 +375,7 @@ impl Wiring {
         // the socket from a browser; a client sends no Origin.
         let mut origins = shell_origins;
         origins.extend(opts.allowed_origins.iter().cloned());
-        Ok(Wired { sessions, login, backend, gate, protected, origins, public_url, providers: opts.providers, access, identity: opts.identity })
+        Ok(Wired { sessions, login, backend, gate, protected, origins, public_url, providers: opts.providers, access, identity: opts.identity, invites })
     }
 }
 
@@ -367,9 +401,18 @@ pub struct Wired<A: LoginAccess> {
     pub access: A,
     /// AUTH-22: the identity backend behind our own page, when there is one.
     pub identity: Option<Arc<dyn IdentityBackend>>,
+    /// IDENTITY-49: the sign-in codes, when they are on.
+    pub invites: Option<Arc<crate::invites::Invites>>,
 }
 
 impl<A: LoginAccess> Wired<A> {
+    /// IDENTITY-49: the `invites` activation (`invites.issue`, `.list`,
+    /// `.revoke`), when codes are on — register it on the service beside
+    /// `auth`.
+    pub fn invites_activation(&self) -> Option<crate::invites_activation::InvitesActivation<A>> {
+        self.invites.clone().map(|i| crate::invites_activation::InvitesActivation::new(i, self.access.clone(), self.sessions.clone()))
+    }
+
     /// Whether login is on (any provider).
     pub fn login_on(&self) -> bool {
         !self.providers.is_empty() || self.identity.is_some()

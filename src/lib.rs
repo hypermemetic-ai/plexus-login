@@ -19,6 +19,7 @@
 //! | [`backends`] | its implementations — WorkOS, plexus-idp, memory — and the `--identity` spec that picks one |
 //! | [`signin`] | our own sign-in page over any backend: email codes, passwords, social and SSO round trips, TOTP, the account page |
 //! | [`app_session`] | what an app keeps once the page signs someone in: its session, the backend's tokens (refreshed, revoked) |
+//! | [`invites`], [`invites_activation`] | IDENTITY-49: sign-in codes — an admin issues one for a role (`invites.issue`), anyone redeems it on the login page (`/login?code=…`), its link drawn as a QR code ([`qr`]) |
 //! | [`throttle`], [`client_ip`], [`crypto`], [`page`] | the page's throttles, its client IP through trusted proxies, HMAC/TOTP, and its chrome and CSP |
 //!
 //! Every type that touches the app's rules is generic over `A: LoginAccess`.
@@ -33,10 +34,13 @@ pub mod client_ip;
 pub mod crypto;
 pub mod dev_login;
 pub mod identity;
+pub mod invites;
+pub mod invites_activation;
 pub mod login;
 pub mod names;
 pub mod once;
 pub mod page;
+pub mod qr;
 pub mod sessions;
 pub mod signin;
 pub mod simple;
