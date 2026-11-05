@@ -524,7 +524,7 @@ out with a strict CSP.
 ## Build and test
 
 A repository and cargo workspace of its own. A checkout builds alone,
-against the plexus 0.7 line from crates.io.
+against the plexus 0.8 line from crates.io.
 
 ```sh
 cargo test --workspace                     # the unit tests and tests/ (the sign-in flows, the toy)
