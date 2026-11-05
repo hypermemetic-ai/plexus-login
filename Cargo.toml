@@ -57,3 +57,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 jsonwebtoken = "9"
 # RUN-9: the shell's metadata route, called as a service.
 tower = { version = "0.5", features = ["util"] }
+# IDENTITY-49: an independent reader for the QR codes src/qr.rs draws.
+rqrr = "0.11"

@@ -241,7 +241,7 @@ impl Row {
 
 /// FRAME-21: where the journal's bytes go — a file, or (in a test) a sink
 /// that refuses.
-trait Sink: Send {
+pub(crate) trait Sink: Send {
     /// Appends `bytes`; `sync`: durably (fsynced) before it answers.
     fn append(&mut self, bytes: &[u8], sync: bool) -> io::Result<()>;
     /// Replaces everything with `bytes`, durably and atomically.
@@ -252,7 +252,7 @@ trait Sink: Send {
 /// for as long as the table lives — on a file of its own, because a
 /// compaction renames a new journal into place and a lock on the old one
 /// would stay with the old inode.
-struct FileSink {
+pub(crate) struct FileSink {
     path: PathBuf,
     file: std::fs::File,
     _lock: std::fs::File,
@@ -270,7 +270,7 @@ fn open_0600(path: &Path, fresh: bool) -> io::Result<std::fs::File> {
     o.open(path)
 }
 
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(suffix);
     PathBuf::from(p)
@@ -278,8 +278,9 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 impl FileSink {
     /// Takes the lock beside `path`, then opens (or makes) the journal: the
-    /// sink and what the journal held.
-    fn open(path: &Path) -> io::Result<(Self, Vec<u8>)> {
+    /// sink and what the journal held. `what` names the file in the refusal
+    /// a second server gets (`sessions`, IDENTITY-49's `invites`).
+    pub(crate) fn open(path: &Path, what: &str) -> io::Result<(Self, Vec<u8>)> {
         use std::os::unix::fs::PermissionsExt;
         let ctx = |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", path.display()));
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -290,7 +291,7 @@ impl FileSink {
         lock.try_lock().map_err(|e| match e {
             std::fs::TryLockError::WouldBlock => io::Error::new(
                 io::ErrorKind::WouldBlock,
-                format!("{} is held by another server ({}): one server keeps one sessions file", path.display(), lock_path.display()),
+                format!("{} is held by another server ({}): one server keeps one {what} file", path.display(), lock_path.display()),
             ),
             std::fs::TryLockError::Error(e) => io::Error::new(e.kind(), format!("cannot lock {}: {e}", lock_path.display())),
         })?;
@@ -390,7 +391,7 @@ impl Sessions {
     /// [`crate::wiring::Wiring`] builds under `sessions_file`.
     pub fn journaled(self, path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
-        let (sink, held) = FileSink::open(path)?;
+        let (sink, held) = FileSink::open(path, "sessions")?;
         self.replay(&held, path);
         let me = self.with_sink(Box::new(sink));
         me.compact().map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;

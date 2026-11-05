@@ -11,6 +11,8 @@
 //! | `GET /login/me` | who the session is, as JSON, or 401 |
 //! | `POST /login/dev` | IDENTITY-35, test only: be a seeded or any user, through plexus-idp ([`crate::dev_login`]) |
 //! | `GET /login?once=…` | DIST-14: a one-time link ([`crate::once`]), from loopback, where the app has them: a session, once |
+//! | `GET /login?code=…` | IDENTITY-49: a sign-in code's link ([`crate::invites`]), from any network: the page with the code filled in, one button to redeem it (a link preview never spends a use) |
+//! | `POST /login/invite` | IDENTITY-49: a code redeemed — the signed-in caller gets its role, anyone else a guest session; throttled as a guess |
 //! | `GET /login?cli=1&state=…` | AUTH-7: the page for a loopback sign-in (`auth.login {browser}`): every way in carries on to `/auth/cli` |
 //! | `GET /auth/cli`, `POST /auth/cli` | AUTH-7: the person is signed in — the sign-in's state taken, a one-time code issued, and the browser sent back to the client's loopback `redirect?code=…&state=…`; a sign-in older than two minutes asks first (a button, POSTed from this page) |
 //!
@@ -146,6 +148,8 @@ pub struct Login<A: LoginAccess> {
     trusted: TrustedProxies,
     /// DIST-14: the app's one-time sign-in links, when it has them.
     once: Option<Arc<dyn crate::once::OnceLinks>>,
+    /// IDENTITY-49: sign-in codes, when they are on.
+    invites: Option<Arc<crate::invites::Invites>>,
 }
 
 impl<A: LoginAccess> Login<A> {
@@ -276,6 +280,7 @@ impl<A: LoginAccess> Login<A> {
             throttles,
             trusted,
             once: None,
+            invites: None,
         })
     }
 
@@ -442,6 +447,50 @@ impl<A: LoginAccess> Login<A> {
         self
     }
 
+    /// IDENTITY-49: sign-in codes ([`crate::invites`]): `/login?code=` and
+    /// the page's code field redeem one, from anywhere.
+    pub fn with_invites(mut self, invites: Option<Arc<crate::invites::Invites>>) -> Self {
+        self.invites = invites;
+        self
+    }
+
+    /// IDENTITY-49: the code field, below the other ways in, when codes are on.
+    fn code_form(&self, next_e: &str, code: &str, main: bool) -> String {
+        if self.invites.is_none() {
+            return String::new();
+        }
+        let (label, class, focus) = if main { ("Sign-in code", "primary", " autofocus") } else { ("Have a sign-in code?", "alt", "") };
+        format!(
+            r#"<form method="post" action="/login/invite" id="invite-form">
+      <input type="hidden" name="next" value="{next_e}">
+      <label for="invite-code">{label}</label>
+      <input id="invite-code" name="code" type="text" value="{code}" placeholder="XXXX-XXXX-XXXXX" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" required{focus}>
+      <button class="{class}" type="submit" id="invite-continue">Sign in with the code</button>
+    </form>"#,
+            code = esc(code)
+        )
+    }
+
+    /// IDENTITY-49: the page for a code — the field filled in, one button.
+    fn code_page(&self, code: &str, next: &str, error: Option<&str>, status: StatusCode) -> Response {
+        let chrome = Chrome {
+            branding: self.branding,
+            title: self.title.to_string(),
+            facts: self.facts(false),
+            dev_cookie: self.sessions.names().dev_cookie.clone(),
+            dev_toggle: String::new(),
+            service_worker: self.service_worker.map(str::to_string),
+        };
+        let body = Body {
+            heading: page::heading("Sign in with a code", &format!("to continue to {}", self.title)),
+            error: error.map(str::to_string),
+            main: self.code_form(&esc(next), code, true),
+            alts: String::new(),
+            extra: String::new(),
+        };
+        page::respond(status, page::render(&chrome, body))
+    }
+
     /// AUTH-22: our own sign-in page, when there is one.
     pub fn signin(&self) -> Option<&Arc<SignInPage>> {
         self.signin.as_ref()
@@ -564,6 +613,13 @@ impl<A: LoginAccess> Login<A> {
         let nostr = self.nostr.as_ref().map(|_| {
             format!(r#"<button class="alt" type="button" id="nostr" data-next="{next_e}">{KEY_ICON}Continue with nostr</button>"#)
         });
+        // IDENTITY-49: the code field, last.
+        let code = self.code_form(&next_e, "", false);
+        let nostr = match (nostr, code.is_empty()) {
+            (n, true) => n,
+            (Some(n), false) => Some(format!("{n}\n      {code}")),
+            (None, false) => Some(code),
+        };
         // AUTH-22: our own page's ways in come first; any other provider's
         // buttons (and, at /login?password, the provider form) follow.
         if let (Some(p), Some(flow)) = (&self.signin, flow) {
@@ -626,6 +682,8 @@ pub struct PageQuery {
     state: Option<String>,
     /// DIST-14: a one-time sign-in link's token ([`crate::once`]).
     once: Option<String>,
+    /// IDENTITY-49: a sign-in code's link ([`crate::invites`]).
+    code: Option<String>,
 }
 
 /// AUTH-7: where a loopback sign-in goes once the person is signed in.
@@ -646,6 +704,12 @@ pub async fn page<A: LoginAccess>(State(login): State<Arc<Login<A>>>, headers: H
             };
         }
     }
+    // IDENTITY-49: a code's link, from anywhere — the page with the code in
+    // it and a button; redeeming is a POST, so a link preview spends nothing.
+    if let (Some(code), Some(_)) = (q.code.as_deref(), login.invites.as_ref()) {
+        let code: String = code.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(32).collect();
+        return login.code_page(&code, &safe_next(q.next.as_deref()), None, StatusCode::OK);
+    }
     let next = match (q.cli.as_deref(), q.state.as_deref()) {
         (Some(_), Some(state)) if login.sessions.cli_waiting(state) => cli_next(state),
         // AUTH-22: with our own page, where to land follows its return
@@ -659,6 +723,53 @@ pub async fn page<A: LoginAccess>(State(login): State<Arc<Login<A>>>, headers: H
     // DIST-14: where one-time links are the way in, the page says how to get one.
     let hint = login.once.as_ref().map(|o| o.hint());
     login.page_view(Some(&headers), &next, hint.as_deref(), q.password.is_some(), login.dev_on(&headers), StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+pub struct CodeForm {
+    code: String,
+    next: Option<String>,
+}
+
+/// IDENTITY-49: `POST /login/invite` — a sign-in code redeemed, from any
+/// network. A guess like any other: a flow, then a reservation against the
+/// client's network ([`Throttles::reserve_code`]), refunded when right. One
+/// refusal for every code that signs no one in.
+pub async fn code<A: LoginAccess>(State(login): State<Arc<Login<A>>>, headers: HeaderMap, peer: Peer, Form(f): Form<CodeForm>) -> Response {
+    let next = safe_next(f.next.as_deref());
+    if login.foreign(&headers) {
+        return (StatusCode::FORBIDDEN, format!("Forbidden: sign in from {}'s own page", login.branding.app)).into_response();
+    }
+    let (Some(invites), Some(access)) = (login.invites.clone(), login.access.clone()) else {
+        return page_response(&login, &next, Some("Sign-in codes are not taken here."), StatusCode::NOT_FOUND);
+    };
+    let typed: String = f.code.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == ' ').take(32).collect();
+    if let Err(r) = login.flow(&peer, &headers, &next) {
+        return r;
+    }
+    let reserved = match login.throttles.reserve_code(login.client(&peer, &headers)) {
+        Ok(r) => r,
+        Err(w) => {
+            tracing::info!("sign-in codes throttled for a client ({w} s)");
+            return too_many(login.code_page(&typed, &next, Some(&SignInPage::wait_words(w)), StatusCode::TOO_MANY_REQUESTS), w);
+        }
+    };
+    let caller = login.session(&headers);
+    let answer = invites.redeem(&access, &typed, caller.as_ref(), login.sessions.ttl_secs());
+    login.throttles.settle(
+        reserved,
+        match &answer {
+            Ok(_) => Outcome::Right,
+            Err(e) if e == crate::invites::REFUSED => Outcome::Wrong,
+            Err(_) => Outcome::NoVerdict,
+        },
+    );
+    match answer {
+        Ok(crate::invites::Redeemed::Guest(ctx)) => login.sign_in(ctx, &next),
+        Ok(crate::invites::Redeemed::Granted { .. }) => see_other(&next),
+        Err(e) if e == crate::invites::REFUSED => login.code_page(&typed, &next, Some(&e), StatusCode::FORBIDDEN),
+        Err(e) => login.code_page(&typed, &next, Some(&e), StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1290,6 +1401,7 @@ pub fn router<A: LoginAccess>(login: Arc<Login<A>>) -> axum::Router {
         .route("/login/nostr", post(nostr::<A>))
         .route("/login/nostr/trace", post(nostr_trace::<A>))
         .route("/login/me", get(me::<A>))
+        .route("/login/invite", post(code::<A>))
         .route("/login/dev", post(dev::<A>))
         .route("/logout", post(logout::<A>))
         .route("/auth/cli", get(cli::<A>).post(cli_confirm::<A>))
