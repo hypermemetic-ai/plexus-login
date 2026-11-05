@@ -13,7 +13,7 @@
 //! | --- | --- |
 //! | [`Invites`] | the codes: issue, list, withdraw, redeem; kept in a journal ([`Invites::journaled`]) |
 //! | [`crate::invites_activation::InvitesActivation`] | `invites.issue`, `invites.list`, `invites.revoke` on the service's socket |
-//! | `GET /login?code=…`, `POST /login/code` | the login page's half ([`crate::web_login`]) |
+//! | `GET /login?code=…`, `POST /login/invite` | the login page's half ([`crate::web_login`]) |
 //!
 //! **A code** is twelve Crockford base-32 characters (60 random bits) and a
 //! check character, grouped `XXXX-XXXX-XXXXX`; typed in, case, dashes and
@@ -236,16 +236,87 @@ impl Invites {
     }
 
     /// These codes kept in a journal at `path`: 0600, beside a lock
-    /// (`<path>.lock`) held while they live, as FRAME-21 keeps sessions.
+    /// (`<path>.lock`) held while they live, as FRAME-21 keeps sessions — a
+    /// second server on the file is refused, naming it. Opening replays the
+    /// rows (a torn last line skipped) and rewrites the file to what is
+    /// kept: every code that can still be redeemed or whose grants still
+    /// stand.
     pub fn journaled(self, path: impl AsRef<Path>) -> io::Result<Self> {
-        let _ = path;
-        Err(io::Error::other("IDENTITY-49: not yet"))
+        let path = path.as_ref();
+        let (sink, held) = FileSink::open(path, "invites")?;
+        {
+            let mut state = self.state.lock().unwrap();
+            for line in held.split(|b| *b == b'\n').filter(|l| !l.iter().all(u8::is_ascii_whitespace)) {
+                match serde_json::from_slice::<Row>(line) {
+                    Ok(row) => state.apply(row),
+                    Err(e) => tracing::warn!(file = %path.display(), "an invites row that does not read is skipped: {e}"),
+                }
+            }
+        }
+        *self.journal.lock().unwrap() = Some(Journal { sink: Box::new(sink), rows: 0 });
+        {
+            let mut journal = self.journal.lock().unwrap();
+            self.compact_into(journal.as_mut().expect("just set")).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        }
+        Ok(self)
+    }
+
+    /// Rewrites the journal to what is kept (dropping, from memory too,
+    /// every code that is over and whose grants are gone).
+    fn compact_into(&self, j: &mut Journal) -> io::Result<()> {
+        let t = now();
+        let bytes: Vec<u8> = {
+            let mut state = self.state.lock().unwrap();
+            let gone: Vec<String> = state.by_id.values().filter(|i| !kept(i, t)).map(|i| i.id.clone()).collect();
+            for id in gone {
+                if let Some(i) = state.by_id.remove(&id) {
+                    state.by_hash.remove(&i.hash);
+                    state.codes.remove(&id);
+                }
+            }
+            state.by_id.values().flat_map(|i| Row::Issue { invite: i.clone() }.line()).collect()
+        };
+        j.rows = bytes.iter().filter(|b| **b == b'\n').count();
+        j.sink.rewrite(&bytes)
+    }
+
+    /// Writes `row` durably to the held journal (none: in memory, nothing
+    /// to write); past ten times the codes kept, rewrites it.
+    fn write(&self, journal: &mut Option<Journal>, row: &Row) -> io::Result<()> {
+        let Some(j) = journal.as_mut() else { return Ok(()) };
+        j.sink.append(&row.line(), true)?;
+        j.rows += 1;
+        let n = self.state.lock().unwrap().by_id.len();
+        if j.rows > (n * 10).max(COMPACT_FLOOR) {
+            if let Err(e) = self.compact_into(j) {
+                tracing::error!("the invites journal could not be compacted: {e}");
+            }
+        }
+        Ok(())
     }
 
     /// Gives the grants codes made back to `access` (at a start): how many.
+    /// A guest's while its session could still stand; a signed-in person's
+    /// unless the code was withdrawn with `sign_out`.
     pub fn restore<A: LoginAccess>(&self, access: &A) -> usize {
-        let _ = access;
-        0
+        let t = now();
+        let grants: Vec<(String, String, String)> = {
+            let state = self.state.lock().unwrap();
+            state
+                .by_id
+                .values()
+                .filter(|i| !i.taken_back)
+                .flat_map(|i| i.redeemed.iter().filter(|r| grant_stands(r, t)).map(|r| (r.principal.clone(), i.role.clone(), i.scope.clone())))
+                .collect()
+        };
+        let mut n = 0;
+        for (principal, role, scope) in grants {
+            match access.invite_grant(&principal, &role, &scope) {
+                Ok(()) => n += 1,
+                Err(e) => tracing::warn!(principal = %principal, role = %role, "a sign-in code's grant could not be given back: {e}"),
+            }
+        }
+        n
     }
 
     /// Where a code's link points.
@@ -255,23 +326,155 @@ impl Invites {
 
     /// `invites.issue`: a code for `req`, by `issuer`.
     pub fn issue<A: LoginAccess>(&self, access: &A, issuer: &AuthContext, req: Issue) -> Result<InviteView, String> {
-        let _ = (access, issuer, req);
-        Err("IDENTITY-49: not yet".into())
+        let by = issuer.principal().ok_or("sign in first")?.to_string();
+        let role = req.role.trim().to_ascii_lowercase();
+        if role.is_empty() || role.len() > 64 || !role.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')) {
+            return Err(format!("`{}` is not a role", req.role.trim()));
+        }
+        let scope = A::scope_of(req.scope.as_deref().unwrap_or("*"))?;
+        access.invite_check(issuer, &role, &scope)?;
+        let uses = req.uses.unwrap_or(1);
+        if !(1..=MAX_USES).contains(&uses) {
+            return Err(format!("uses is 1 to {MAX_USES}"));
+        }
+        let secs = match req.expires_in.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => DEFAULT_EXPIRES_SECS,
+            Some(text) => duration(text).ok_or_else(|| format!("expires_in `{text}`: a number and s, m, h or d (30m, 24h, 7d)"))?,
+        };
+        if !(1..=MAX_EXPIRES_SECS).contains(&secs) {
+            return Err("expires_in is at most 30d".into());
+        }
+        let label = req.label.as_deref().map(clean).filter(|l| !l.is_empty());
+        let mut journal = self.journal.lock().unwrap();
+        let t = now();
+        let (code, id) = {
+            let state = self.state.lock().unwrap();
+            if state.by_id.values().filter(|i| open(i, t)).count() >= MAX_OPEN {
+                return Err(format!("{MAX_OPEN} codes are open already: withdraw some (invites.revoke)"));
+            }
+            let mut id = random_id();
+            while state.by_id.contains_key(&id) {
+                id = random_id();
+            }
+            (new_code(), id)
+        };
+        let invite = Invite {
+            id: id.clone(),
+            hash: hash(&normalize(&code).expect("a fresh code reads")),
+            role,
+            scope,
+            uses,
+            used: 0,
+            expires_at: t + secs,
+            label,
+            issued_by: by,
+            issued_at: t,
+            revoked_at: None,
+            taken_back: false,
+            redeemed: Vec::new(),
+        };
+        self.write(&mut journal, &Row::Issue { invite: invite.clone() }).map_err(|e| {
+            tracing::error!("a sign-in code could not be kept: {e}");
+            "the code could not be kept: try again".to_string()
+        })?;
+        let mut state = self.state.lock().unwrap();
+        state.codes.insert(id.clone(), code);
+        state.put(invite);
+        Ok(self.view(&state, &id, true, true))
     }
 
-    /// `invites.list`: every code for an admin, else the caller's own; the
-    /// QR codes when `qr`.
+    /// The view of a code; the code itself (and link, and QR) when
+    /// `secret` and this server made it.
+    fn view(&self, state: &State, id: &str, secret: bool, qr: bool) -> InviteView {
+        let i = &state.by_id[id];
+        let t = now();
+        let code = state.codes.get(id).filter(|_| secret).cloned();
+        let url = code.as_deref().map(|c| self.url_of(c));
+        let qr_svg = url.as_deref().filter(|_| qr && open(i, t)).and_then(crate::qr::svg);
+        let state_word = if i.revoked_at.is_some() {
+            "withdrawn"
+        } else if i.used >= i.uses {
+            "spent"
+        } else if i.expires_at <= t {
+            "expired"
+        } else {
+            "open"
+        };
+        InviteView {
+            id: i.id.clone(),
+            code,
+            url,
+            qr_svg,
+            role: i.role.clone(),
+            scope: i.scope.clone(),
+            uses: i.uses,
+            used: i.used,
+            left: i.uses.saturating_sub(i.used),
+            expires_at: i.expires_at,
+            label: i.label.clone(),
+            issued_by: i.issued_by.clone(),
+            issued_at: i.issued_at,
+            state: state_word.into(),
+            revoked_at: i.revoked_at,
+            redeemed: i.redeemed.clone(),
+        }
+    }
+
+    /// `invites.list`: every code for an admin, else the caller's own,
+    /// newest first; the QR codes of open ones when `qr`.
     pub fn list<A: LoginAccess>(&self, access: &A, caller: &AuthContext, qr: bool) -> Vec<InviteView> {
-        let _ = (access, caller, qr);
-        Vec::new()
+        let admin = access.is_admin(caller);
+        let me = caller.principal().map(|p| p.to_string()).unwrap_or_default();
+        let state = self.state.lock().unwrap();
+        let mut ids: Vec<(i64, String)> =
+            state.by_id.values().filter(|i| admin || i.issued_by == me).map(|i| (i.issued_at, i.id.clone())).collect();
+        ids.sort_by(|a, b| b.cmp(a));
+        ids.into_iter().map(|(_, id)| self.view(&state, &id, true, qr)).collect()
     }
 
     /// `invites.revoke`: the code (by id or by the code) stops working;
     /// with `sign_out`, its grants are taken back and its guests' sessions
-    /// ended. The code as it stands, and how many sessions ended.
+    /// ended. The code as it stands, and how many sessions ended. Only its
+    /// issuer or an admin; to anyone else it does not exist.
     pub fn revoke<A: LoginAccess>(&self, access: &A, caller: &AuthContext, key: &str, sign_out: bool, sessions: &Sessions) -> Result<(InviteView, usize), String> {
-        let _ = (access, caller, key, sign_out, sessions);
-        Err("IDENTITY-49: not yet".into())
+        let me = caller.principal().ok_or("sign in first")?.to_string();
+        let admin = access.is_admin(caller);
+        let mut journal = self.journal.lock().unwrap();
+        let (id, grants) = {
+            let state = self.state.lock().unwrap();
+            let key = key.trim();
+            let id = match state.by_id.get(key) {
+                Some(i) => Some(i.id.clone()),
+                None => normalize(key).and_then(|c| state.by_hash.get(&hash(&c)).cloned()),
+            };
+            let inv = id.as_ref().and_then(|id| state.by_id.get(id)).filter(|i| admin || i.issued_by == me);
+            let inv = inv.ok_or_else(|| format!("no code `{key}` of yours here: invites.list says which there are"))?;
+            let grants: Vec<Redemption> = if sign_out && !inv.taken_back { inv.redeemed.clone() } else { Vec::new() };
+            (inv.id.clone(), grants)
+        };
+        let at = now();
+        self.write(&mut journal, &Row::Revoke { id: id.clone(), at, sign_out }).map_err(|e| {
+            tracing::error!("a sign-in code's withdrawal could not be kept: {e}");
+            "the withdrawal could not be kept: try again".to_string()
+        })?;
+        let mut state = self.state.lock().unwrap();
+        state.apply(Row::Revoke { id: id.clone(), at, sign_out });
+        let (role, scope) = (state.by_id[&id].role.clone(), state.by_id[&id].scope.clone());
+        let mut ended = 0;
+        if !grants.is_empty() {
+            let guests: Vec<&str> = grants.iter().filter(|r| r.guest).map(|r| r.principal.as_str()).collect();
+            for (key, ctx) in sessions.standing() {
+                if ctx.principal().is_some_and(|p| guests.contains(&p.to_string().as_str())) && sessions.end_key(&key) {
+                    ended += 1;
+                }
+            }
+            for r in &grants {
+                if let Err(e) = access.invite_revoke(&r.principal, &role, &scope) {
+                    tracing::warn!(principal = %r.principal, "a sign-in code's grant could not be taken back: {e}");
+                }
+            }
+        }
+        Ok((self.view(&state, &id, true, false), ended))
     }
 
     /// The page's redemption of `code`: `caller`, when signed in, gets the
@@ -279,9 +482,91 @@ impl Invites {
     /// `Err` is [`REFUSED`] for any code that signs no one in, or the words
     /// for a server that could not keep it.
     pub fn redeem<A: LoginAccess>(&self, access: &A, code: &str, caller: Option<&AuthContext>, guest_ttl: i64) -> Result<Redeemed, String> {
-        let _ = (access, code, caller, guest_ttl);
-        Err(REFUSED.into())
+        let canon = normalize(code).ok_or(REFUSED)?;
+        // One redemption at a time: the count is checked and spent together.
+        let mut journal = self.journal.lock().unwrap();
+        let t = now();
+        let signed_in = caller.filter(|c| c.is_authenticated()).and_then(|c| c.principal()).map(|p| p.to_string());
+        let (inv, redemption) = {
+            let state = self.state.lock().unwrap();
+            let inv = state.by_hash.get(&hash(&canon)).and_then(|id| state.by_id.get(id)).ok_or(REFUSED)?.clone();
+            match &signed_in {
+                // Theirs already, from this code (spent since or not): nothing spent.
+                Some(p) if inv.revoked_at.is_none() && inv.redeemed.iter().any(|r| &r.principal == p) => {
+                    return Ok(Redeemed::Granted { principal: p.clone() })
+                }
+                _ if !open(&inv, t) => return Err(REFUSED.into()),
+                Some(p) => (inv, Redemption { principal: p.clone(), at: t, guest: false, until: None }),
+                None => {
+                    let principal = format!("oidc:{GUEST_PROVIDER}/{}.{}", inv.id, inv.used + 1);
+                    (inv, Redemption { principal, at: t, guest: true, until: Some(t + guest_ttl.max(1)) })
+                }
+            }
+        };
+        access.invite_grant(&redemption.principal, &inv.role, &inv.scope).map_err(|e| {
+            tracing::error!(role = %inv.role, "a sign-in code's role could not be granted: {e}");
+            format!("Signing in with a code is unavailable: {e}")
+        })?;
+        let row = Row::Redeem { id: inv.id.clone(), redemption: redemption.clone() };
+        if let Err(e) = self.write(&mut journal, &row) {
+            tracing::error!("a sign-in code's use could not be kept: {e}");
+            let _ = access.invite_revoke(&redemption.principal, &inv.role, &inv.scope);
+            return Err("Signing in is unavailable for a moment: the code's use could not be kept. Try again.".into());
+        }
+        self.state.lock().unwrap().apply(row);
+        Ok(if redemption.guest {
+            let meta = guest_meta(&redemption.principal, inv.label.as_deref(), &inv.id);
+            Redeemed::Guest(AuthContext::new(redemption.principal.clone(), "invite".into(), vec![], meta))
+        } else {
+            Redeemed::Granted { principal: redemption.principal }
+        })
     }
+}
+
+/// Rows past this many, and ten times the codes kept, rewrite the journal.
+const COMPACT_FLOOR: usize = 1_000;
+
+/// Whether a code can still sign someone in at `t`.
+fn open(i: &Invite, t: i64) -> bool {
+    i.revoked_at.is_none() && i.used < i.uses && i.expires_at > t
+}
+
+/// Whether a redemption's grant still stands at `t`.
+fn grant_stands(r: &Redemption, t: i64) -> bool {
+    !r.guest || r.until.is_some_and(|u| u > t)
+}
+
+/// Whether a code is kept: open, or a grant it made still stands.
+fn kept(i: &Invite, t: i64) -> bool {
+    open(i, t) || (!i.taken_back && i.redeemed.iter().any(|r| grant_stands(r, t)))
+}
+
+/// `30m`, `24h`, `7d`, `90s` or bare seconds.
+fn duration(text: &str) -> Option<i64> {
+    let (n, unit) = match text.char_indices().last()? {
+        (i, c) if c.is_ascii_alphabetic() => (&text[..i], c.to_ascii_lowercase()),
+        _ => (text, 's'),
+    };
+    let n: i64 = n.trim().parse().ok().filter(|n| *n > 0)?;
+    n.checked_mul(match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return None,
+    })
+}
+
+/// A label: printable, at most 80 characters.
+fn clean(text: &str) -> String {
+    text.trim().chars().filter(|c| !c.is_control()).take(80).collect()
+}
+
+/// A code's id: eight hex digits.
+fn random_id() -> String {
+    let mut b = [0u8; 4];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 // ── The code ───────────────────────────────────────────────────────────
@@ -341,7 +626,6 @@ pub fn beside(sessions_file: &Path) -> PathBuf {
     sessions_file.with_file_name(format!("{stem}-invites.jsonl"))
 }
 
-#[allow(dead_code)]
 fn guest_meta(principal: &str, label: Option<&str>, id: &str) -> serde_json::Value {
     json!({ "principal": principal, "name": label.unwrap_or("guest"), "provider": GUEST_PROVIDER, "auth_method": "invite", "invite": id })
 }
@@ -379,6 +663,16 @@ mod tests {
         assert!(normalize(&format!("{c}0")).is_none(), "too long");
         // Two codes differ.
         assert_ne!(new_code(), new_code());
+    }
+
+    #[test]
+    fn a_duration_is_a_number_and_a_unit() {
+        assert_eq!(duration("30m"), Some(1800));
+        assert_eq!(duration("24h"), Some(86_400));
+        assert_eq!(duration("7D"), Some(604_800));
+        assert_eq!(duration("90"), Some(90));
+        assert_eq!(duration("1s"), Some(1));
+        assert!(duration("h").is_none() && duration("-5m").is_none() && duration("5w").is_none() && duration("0").is_none());
     }
 
     #[test]

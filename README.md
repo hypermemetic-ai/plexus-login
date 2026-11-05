@@ -266,6 +266,9 @@ pub struct LoginOptions {
     pub trusted_proxies: TrustedProxies, // --trusted-proxy CIDRs
     pub return_origins: Vec<String>,     // --return-origin: more origins a sign-in may return to
     pub limits: Limits,                  // the page's throttles
+    pub once: Option<Arc<dyn OnceLinks>>, // DIST-14: the console's one-time link (loopback only)
+    pub invites: bool,                   // IDENTITY-49: sign-in codes (needs the page)
+    pub invites_file: Option<PathBuf>,   // IDENTITY-49: their journal (sets `invites`; default beside sessions_file)
 }
 impl LoginOptions {
     pub fn new(branding: Branding, ws_port: u16, shell_port: u16) -> Self;
@@ -291,8 +294,10 @@ pub struct Wired<A: LoginAccess> {
     pub public_url: String,
     pub providers: Vec<Provider>,
     pub access: A,
+    pub invites: Option<Arc<Invites>>,    // IDENTITY-49: the sign-in codes, when on
 }
 impl<A: LoginAccess> Wired<A> {
+    pub fn invites_activation(&self) -> Option<InvitesActivation<A>>; // register it beside `auth`
     pub fn apply<H: Activation>(&self, b: TransportServerBuilder<H>) -> TransportServerBuilder<H>;
     pub fn router(&self) -> Option<axum::Router>;   // every /login… route
     pub fn metadata_url(&self) -> Option<String>;   // for the service's 401s
@@ -367,6 +372,76 @@ beside its database):
   backend; but it is never refreshed, so **a revocation made at the backend
   no longer ends it here** — it stands until its own expiry.
 
+## Sign-in codes (IDENTITY-49)
+
+An admin hands someone a role without knowing who they will sign in as:
+a **sign-in code** carries one role on one scope, so many uses, until a
+time. The person opens its link, scans its QR code or types it into the
+login page — from any network — and is signed in with that role and no
+more. The console's one-time link (`?once=`, `crate::once`) is a different
+door and stays loopback-only.
+
+Turn them on with `LoginOptions::invites` (or `invites_file`), and register
+the activation beside `auth`:
+
+```rust
+let opts = LoginOptions { invites: true, sessions_file: Some(dir.join("sessions.jsonl")), page: true, ..LoginOptions::new(BRANDING, ws, http) }
+    .with_providers(["key"])?;
+let wiring = Wiring::new(opts)?;
+let access = SimpleAccess::new(wiring.sessions(), &admins)?;
+let wired = wiring.finish(access.clone(), None)?;        // codes kept in dir/sessions-invites.jsonl, their grants given back
+let service = DynamicHub::new("toy")
+    .with_auth(access.auth_setup(wired.backend.clone()))
+    .register(wired.invites_activation().expect("codes are on"));
+access.seed_roles(&service);
+```
+
+| method | who | answers |
+| --- | --- | --- |
+| `invites.issue {role, scope?, uses?, expires_in?, label?}` | admin, or a role `auth.role_set` gave `invites.issue` — and only a role the issuer holds | `{type: "invite", id, code, url, qr_svg, role, scope, uses, used, left, expires_at, label, issued_by, issued_at, state, redeemed}` |
+| `invites.list {qr?}` | admin (every code), or a role given `invites.list` (its own) | an `invite` per code, newest first |
+| `invites.revoke {id \| code, sign_out?}` | its issuer, or an admin | `{type: "revoked", invite, signed_out}` |
+
+```sh
+synapse -P 4470 toy invites issue --role viewer --uses 5 --expires-in 24h --label "kitchen table"
+synapse -P 4470 toy invites list
+synapse -P 4470 toy invites revoke --id 3fa9c2d1 --sign-out true
+```
+
+- **The activation is plexus-login's own** (`invites`), written by hand:
+  plexus-core's `auth` activation and its `AuthBackend` take no new
+  methods without a plexus-core change, and a macro-built activation would
+  add dependencies the manifest-only 0.8 overlays do not name. Its methods
+  are in no role's list, so only admin holds them until `auth.role_set`
+  adds them to a role.
+- **A code** is `XXXX-XXXX-XXXXX`: twelve Crockford base-32 characters (60
+  random bits) and a check character. Case, dashes and spaces do not
+  matter; `O` reads as `0`, `I` and `L` as `1`. `expires_in` is `30m`,
+  `24h`, `7d` or seconds (default 24 h, at most 30 d); `uses` 1–1,000
+  (default 1); at most 1,000 codes open at once.
+- **Redeeming**: `GET /login?code=C` shows the page with the code filled
+  in; `POST /login/invite` (the button, or the page's own code field) spends
+  a use. Someone signed in already gets the role on their own principal (no
+  use spent if they had it from this code); anyone else becomes a guest,
+  `oidc:invite/<id>.<n>` named by the label, with a session of the usual
+  length. A spent, expired, withdrawn, mistyped or unknown code gets the
+  same words (403). Each attempt is a guess against the page's own
+  throttles (`Throttles::reserve_code`: 429 and `Retry-After` past
+  `Limits::try_per_client`). No `--auth-provider` may be named `invite`.
+- **The link and its QR code**: `<public_url>/login?code=C`, drawn by
+  `qr::svg` (byte mode, level M, versions 1–10, a four-module quiet zone,
+  one `<path>`). The code itself, its link and QR code go only to its issuer
+  and admins, and only while the server that made it runs.
+- **Kept** (`invites_file`, or beside `sessions_file`): a journal, 0600,
+  beside its lock, like the sessions'. It holds each code's sha256, never
+  the code, and every use and withdrawal. At start the grants codes made are
+  given back to the rules (`SimpleAccess` forgets them at a restart): a
+  guest's until its session's end, a signed-in person's until the code is
+  withdrawn with `sign_out`. A grant taken back with `auth.revoke` alone is
+  given again at the next start. Withdraw the code with `--sign-out true`
+  to end it for good: that takes back each grant it made and ends its
+  guests' sessions.
+
 ## The seam: `LoginAccess`
 
 The login layer knows who someone is. The app decides what they may do,
@@ -387,6 +462,11 @@ pub trait LoginAccess: Clone + Send + Sync + 'static {
     fn waiting(&self) -> Vec<Waiting>;
     fn logout(&self, caller: Option<&AuthContext>) -> Result<(), String>;
     fn session_key(&self) -> Option<&str>;                                  // the table's key, never a copy
+    // IDENTITY-49, each defaulted to "no sign-in codes here":
+    fn invite_check(&self, issuer: &AuthContext, role: &str, scope: &str) -> Result<(), String>; // a known role the issuer holds
+    fn invite_grant(&self, principal: &str, role: &str, scope: &str) -> Result<(), String>;      // a redemption, and every start
+    fn invite_revoke(&self, principal: &str, role: &str, scope: &str) -> Result<(), String>;     // withdrawn with sign_out
+    fn is_admin(&self, ctx: &AuthContext) -> bool;                                               // sees every code
 }
 ```
 
@@ -396,7 +476,7 @@ form.
 
 | implementation | rules |
 | --- | --- |
-| `simple::SimpleAccess` | ships with the crate. It is in memory, over plexus-core's `MemoryRoles` and `MemoryMemberships`. Roles are global: every grant is on `*`. The roles are `viewer`, `editor` and `admin` (`SimpleRole`). Admins are named at startup, and everyone else who signs in waits for one: `auth.waiting`, then `auth.grant`. A restart forgets every grant except the named admins'. |
+| `simple::SimpleAccess` | ships with the crate. It is in memory, over plexus-core's `MemoryRoles` and `MemoryMemberships`. Roles are global: every grant is on `*`. The roles are `viewer`, `editor` and `admin` (`SimpleRole`). Admins are named at startup, and everyone else who signs in waits for one: `auth.waiting`, then `auth.grant`. A restart forgets every grant except the named admins' (and, with sign-in codes kept, those the codes made, which `Wiring::finish` gives back). |
 | menger's `MengerAccess` | menger's members table, with roles per shortcode, its waiting list, and its sessions. It lives in `src/login_access.rs`, and is a newtype because of the orphan rule. |
 
 ## Names: `LoginNames` and `Branding`
@@ -483,6 +563,8 @@ through `LoginAccess::dev_grant` / `dev_set_grants`.
 | `POST /login/dev` | the dev sign-in |
 | `POST /logout` | sign-out (and WorkOS's) |
 | `GET`/`POST /auth/cli` | the loopback sign-in's hand-back to a client (`auth.login {browser}`) |
+| `GET /login?code=…` | IDENTITY-49: a sign-in code's link — the page with the code filled in and one button (a GET spends nothing, so a link preview cannot) |
+| `POST /login/invite` | IDENTITY-49: a sign-in code redeemed, from any network |
 | `POST /login/email`, `/login/code`, `/login/password`, `/login/continue`, `/login/choose`, `/login/social`, `GET`/`POST /login/account…` | AUTH-22: our own page's steps, with an identity backend (above) |
 
 A POST from another origin is refused.

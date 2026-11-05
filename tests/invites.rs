@@ -56,8 +56,8 @@ struct Toy {
     router: axum::Router,
 }
 
-fn options(ws: u16, shell: u16, tweak: impl FnOnce(&mut LoginOptions)) -> LoginOptions {
-    let mut opts = LoginOptions::new(BRANDING, ws, shell).with_providers(["key"]).unwrap();
+fn options(ws: u16, http: u16, tweak: impl FnOnce(&mut LoginOptions)) -> LoginOptions {
+    let mut opts = LoginOptions::new(BRANDING, ws, http).with_providers(["key"]).unwrap();
     opts.invites = true;
     tweak(&mut opts);
     opts
@@ -68,12 +68,14 @@ fn wire(opts: LoginOptions) -> (Wired<SimpleAccess>, SimpleAccess) {
     let wiring = Wiring::new(opts).unwrap();
     let access = SimpleAccess::new(wiring.sessions(), &[ADMIN.to_string()]).unwrap();
     let wired = wiring.finish(access.clone(), None).unwrap();
+    // The roles the service declares, as a host seeds them.
+    access.seed_roles(&DynamicHub::new("toy").with_auth(access.auth_setup(wired.backend.clone())));
     (wired, access)
 }
 
 async fn toy(tweak: impl FnOnce(&mut LoginOptions)) -> Toy {
-    let (ws, shell) = (free_port().await, free_port().await);
-    let (wired, access) = wire(options(ws, shell, tweak));
+    let (ws, http) = (free_port().await, free_port().await);
+    let (wired, access) = wire(options(ws, http, tweak));
     let service = DynamicHub::new("toy")
         .with_auth(access.auth_setup(wired.backend.clone()))
         .register(wired.invites_activation().expect("codes are on"));
@@ -116,9 +118,9 @@ impl Toy {
         self.send(Request::get(path).body(Body::empty()).unwrap(), ip).await
     }
 
-    /// `POST /login/code` from `ip`, with `cookie` when signed in.
+    /// `POST /login/invite` from `ip`, with `cookie` when signed in.
     async fn redeem(&self, code: &str, ip: &str, cookie: Option<&str>) -> axum::response::Response {
-        let mut req = Request::post("/login/code")
+        let mut req = Request::post("/login/invite")
             .header("origin", &self.wired.public_url)
             .header("content-type", "application/x-www-form-urlencoded");
         if let Some(c) = cookie {
@@ -199,7 +201,7 @@ async fn issue_then_redeem_from_a_peer_off_this_machine_is_a_guest_holding_exact
 
     // The page has a code field; the link fills it in and spends nothing.
     let page = text(toy.get("/login", AWAY).await).await;
-    assert!(page.contains(r#"action="/login/code""#), "the code field");
+    assert!(page.contains(r#"action="/login/invite""#), "the code field");
     let linked = toy.get(&format!("/login?code={code}"), AWAY).await;
     assert_eq!(linked.status(), StatusCode::OK);
     assert!(session_cookie(&linked, toy.wired.sessions.cookie_name()).is_none(), "a GET signs no one in");
@@ -346,8 +348,8 @@ async fn a_restart_keeps_codes_their_counts_and_the_grants_they_made() {
     let dir = std::env::temp_dir().join(format!("plexus-login-invites-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let file = dir.join("toy-invites.jsonl");
-    let (ws, shell) = (free_port().await, free_port().await);
-    let opts = || options(ws, shell, |o| o.invites_file = Some(file.clone()));
+    let (ws, http) = (free_port().await, free_port().await);
+    let opts = || options(ws, http, |o| o.invites_file = Some(file.clone()));
 
     let (code, guest, id) = {
         let (wired, access) = wire(opts());
@@ -441,4 +443,14 @@ fn codes_need_the_page_and_the_guests_provider_name_is_taken() {
     assert!(w.finish(access, None).is_err(), "no page, no codes");
     let named = LoginOptions::new(BRANDING, 1, 2).with_providers(["oidc:invite=http://127.0.0.1:9,toy"]).unwrap();
     assert!(Wiring::new(named).is_err());
+}
+
+#[test]
+fn codes_sit_beside_our_own_sign_in_page_and_its_emailed_codes() {
+    use plexus_login::backends::memory::{Memory, MemoryOptions};
+    let mem: Arc<dyn plexus_login::IdentityBackend> = Arc::new(Memory::new(MemoryOptions::default()));
+    let opts = LoginOptions { identity: Some(mem), allow_development_backends: true, invites: true, ..LoginOptions::new(BRANDING, 1, 2) };
+    let (wired, _) = wire(opts);
+    // Its emailed codes are POST /login/code; a sign-in code is /login/invite.
+    assert!(wired.router().is_some());
 }

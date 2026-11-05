@@ -12,7 +12,7 @@
 //! | `POST /login/dev` | IDENTITY-35, test only: be a seeded or any user, through plexus-idp ([`crate::dev_login`]) |
 //! | `GET /login?once=…` | DIST-14: a one-time link ([`crate::once`]), from loopback, where the app has them: a session, once |
 //! | `GET /login?code=…` | IDENTITY-49: a sign-in code's link ([`crate::invites`]), from any network: the page with the code filled in, one button to redeem it (a link preview never spends a use) |
-//! | `POST /login/code` | IDENTITY-49: a code redeemed — the signed-in caller gets its role, anyone else a guest session; throttled as a guess |
+//! | `POST /login/invite` | IDENTITY-49: a code redeemed — the signed-in caller gets its role, anyone else a guest session; throttled as a guess |
 //! | `GET /login?cli=1&state=…` | AUTH-7: the page for a loopback sign-in (`auth.login {browser}`): every way in carries on to `/auth/cli` |
 //! | `GET /auth/cli`, `POST /auth/cli` | AUTH-7: the person is signed in — the sign-in's state taken, a one-time code issued, and the browser sent back to the client's loopback `redirect?code=…&state=…`; a sign-in older than two minutes asks first (a button, POSTed from this page) |
 //!
@@ -461,11 +461,11 @@ impl<A: LoginAccess> Login<A> {
         }
         let (label, class, focus) = if main { ("Sign-in code", "primary", " autofocus") } else { ("Have a sign-in code?", "alt", "") };
         format!(
-            r#"<form method="post" action="/login/code" id="code-form">
+            r#"<form method="post" action="/login/invite" id="invite-form">
       <input type="hidden" name="next" value="{next_e}">
       <label for="invite-code">{label}</label>
       <input id="invite-code" name="code" type="text" value="{code}" placeholder="XXXX-XXXX-XXXXX" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" required{focus}>
-      <button class="{class}" type="submit" id="code-continue">Sign in with the code</button>
+      <button class="{class}" type="submit" id="invite-continue">Sign in with the code</button>
     </form>"#,
             code = esc(code)
         )
@@ -731,7 +731,7 @@ pub struct CodeForm {
     next: Option<String>,
 }
 
-/// IDENTITY-49: `POST /login/code` — a sign-in code redeemed, from any
+/// IDENTITY-49: `POST /login/invite` — a sign-in code redeemed, from any
 /// network. A guess like any other: a flow, then a reservation against the
 /// client's network ([`Throttles::reserve_code`]), refunded when right. One
 /// refusal for every code that signs no one in.
@@ -1401,7 +1401,7 @@ pub fn router<A: LoginAccess>(login: Arc<Login<A>>) -> axum::Router {
         .route("/login/nostr", post(nostr::<A>))
         .route("/login/nostr/trace", post(nostr_trace::<A>))
         .route("/login/me", get(me::<A>))
-        .route("/login/code", post(code::<A>))
+        .route("/login/invite", post(code::<A>))
         .route("/login/dev", post(dev::<A>))
         .route("/logout", post(logout::<A>))
         .route("/auth/cli", get(cli::<A>).post(cli_confirm::<A>))
