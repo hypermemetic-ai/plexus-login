@@ -30,7 +30,7 @@ use std::fmt;
 use std::net::IpAddr;
 
 use async_trait::async_trait;
-use plexus_core::plexus::AuthContext;
+use plexus_rpc::core::plexus::AuthContext;
 
 use crate::login::Provider;
 

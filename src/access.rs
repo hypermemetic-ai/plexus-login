@@ -15,7 +15,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use plexus_core::plexus::{AuthContext, Session, Waiting};
+use plexus_rpc::core::plexus::{AuthContext, Session, Waiting};
 
 /// The app's access rules, as the login layer reaches them. Cheap to clone
 /// (a handle): the login page, the gate and the auth backend each hold one.

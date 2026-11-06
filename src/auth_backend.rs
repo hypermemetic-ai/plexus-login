@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use plexus_core::plexus::{
+use plexus_rpc::core::plexus::{
     AuthBackend, AuthContext, AuthFailure, LoginAnswer, LoginFlow, Provider as AuthProvider, ProviderKind,
     SignupAnswer, Waiting as AuthWaiting,
 };

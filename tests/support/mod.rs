@@ -16,7 +16,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use plexus_core::plexus::DynamicHub;
+use plexus_rpc::core::plexus::DynamicHub;
 use plexus_login::backends::memory::{Memory, MemoryOptions};
 use plexus_login::backends::plexus_idp::PlexusIdp;
 use plexus_login::backends::workos::{ApiKey, WorkOs, WorkOsConfig};
@@ -26,7 +26,7 @@ use plexus_login::simple::SimpleAccess;
 use plexus_login::throttle::Limits;
 use plexus_login::web_login::Login;
 use plexus_login::{Branding, LoginOptions, Wiring};
-use plexus_transport::TransportServer;
+use plexus_rpc::transport::TransportServer;
 use serde_json::{json, Value};
 
 pub use fake_workos::{FakeWorkOs, KEY};

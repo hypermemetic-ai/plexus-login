@@ -30,7 +30,7 @@ pub mod api;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use plexus_auth_core::identity::{Authenticator, Presentation, Principal};
+use plexus_rpc::auth_core::identity::{Authenticator, Presentation, Principal};
 use serde_json::{json, Value};
 
 use self::api::{AuthError, Authenticated, CallError, Grant, WorkOsApi};

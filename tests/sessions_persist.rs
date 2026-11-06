@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use plexus_core::plexus::AuthContext;
+use plexus_rpc::core::plexus::AuthContext;
 use plexus_login::sessions::Sessions;
 use plexus_login::LoginNames;
 use serde_json::{json, Value};

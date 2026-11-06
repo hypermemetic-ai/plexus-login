@@ -48,8 +48,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use plexus_auth_core::adapters::Carriers;
-use plexus_core::plexus::{AuthContext, SessionValidator};
+use plexus_rpc::auth_core::adapters::Carriers;
+use plexus_rpc::core::plexus::{AuthContext, SessionValidator};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 

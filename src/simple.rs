@@ -13,7 +13,7 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use plexus_core::plexus::DynamicHub;
+//! # use plexus_rpc::core::plexus::DynamicHub;
 //! # use plexus_login::{Branding, LoginOptions, Wiring, simple::SimpleAccess};
 //! # async fn run() -> anyhow::Result<()> {
 //! const BRANDING: Branding = Branding { app: "myapp", version: "0.1.0", mark: "m", motto: "" };
@@ -32,9 +32,9 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use plexus_auth_core::identity::Principal;
-use plexus_auth_core::RoleName;
-use plexus_core::plexus::{
+use plexus_rpc::auth_core::identity::Principal;
+use plexus_rpc::auth_core::RoleName;
+use plexus_rpc::core::plexus::{
     AuthBackend, AuthContext, AuthSetup, Ceiling, DynamicHub, Membership, MembershipStore, Memberships, MemoryMemberships,
     MemoryRoles, Resolve, ScopeRef, Session, Waiting, ADMIN, CEILING_KEY,
 };
@@ -350,7 +350,7 @@ mod tests {
 
     fn signed_in(principal: &str, name: &str) -> AuthContext {
         let p: Principal = principal.parse().unwrap();
-        plexus_auth_core::identity::Authenticated::new(p, "sid", vec![], json!({ "name": name, "provider": "plexus-idp" })).into_auth_context()
+        plexus_rpc::auth_core::identity::Authenticated::new(p, "sid", vec![], json!({ "name": name, "provider": "plexus-idp" })).into_auth_context()
     }
 
     fn access() -> SimpleAccess {

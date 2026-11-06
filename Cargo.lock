@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "plexus-login"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1682,9 +1682,7 @@ dependencies = [
  "ipnet",
  "jsonrpsee",
  "jsonwebtoken",
- "plexus-auth-core",
- "plexus-core",
- "plexus-transport",
+ "plexus-rpc",
  "rand 0.8.8",
  "reqwest",
  "serde",
@@ -1700,15 +1698,39 @@ dependencies = [
 
 [[package]]
 name = "plexus-macros"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a9298423ad52ca15b4782057c08b1a6f37a06300b5a3d86d5bb50b9a58dbb16"
+checksum = "358c3689d6d3b6cccbcb324d8212ae62141ab561186b9e90cb9b80fe72e6181b"
 dependencies = [
+ "heck",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
  "serde_json",
  "syn 2.0.119",
+ "uuid",
+]
+
+[[package]]
+name = "plexus-rpc"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f86270685c284a2599f566b776515585823c88c6d16cb5d021764acfee49cb16"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "futures",
+ "jsonrpsee",
+ "plexus-auth-core",
+ "plexus-client",
+ "plexus-core",
+ "plexus-macros",
+ "plexus-transport",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -3453,3 +3475,23 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "plexus-login"
+version = "0.3.1"
+
+[[patch.unused]]
+name = "plexus-transcription"
+version = "0.1.1"
+
+[[patch.unused]]
+name = "plexus-ui-compiler"
+version = "0.2.0"
+
+[[patch.unused]]
+name = "plexus-ui-service"
+version = "0.2.0"
+
+[[patch.unused]]
+name = "plexus-webapp"
+version = "0.3.1"

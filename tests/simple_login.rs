@@ -19,10 +19,10 @@ use jsonrpsee::core::client::{Subscription, SubscriptionClientT};
 use jsonrpsee::core::params::ObjectParams;
 use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClient, WsClientBuilder};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use plexus_core::plexus::DynamicHub;
+use plexus_rpc::core::plexus::DynamicHub;
 use plexus_login::simple::SimpleAccess;
 use plexus_login::{Branding, LoginAccess, LoginOptions, Wiring};
-use plexus_transport::TransportServer;
+use plexus_rpc::transport::TransportServer;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
