@@ -10,7 +10,7 @@
 //! and only for a caller on loopback; anywhere else `?once=` is an unknown
 //! query and the plain page is served.
 
-use plexus_core::plexus::AuthContext;
+use plexus_rpc::core::plexus::AuthContext;
 
 /// The app's one-time links.
 pub trait OnceLinks: Send + Sync {

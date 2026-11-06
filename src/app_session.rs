@@ -257,7 +257,7 @@ impl Continuation for AppContinuation {
 mod tests {
     use super::*;
     use crate::backends::memory::{Memory, MemoryOptions};
-    use plexus_core::plexus::AuthContext;
+    use plexus_rpc::core::plexus::AuthContext;
     use serde_json::json;
 
     #[tokio::test]

@@ -28,9 +28,9 @@
 
 use std::sync::Arc;
 
-use plexus_auth_core::adapters::Carriers;
-use plexus_core::plexus::Activation;
-use plexus_transport::{ProtectedResource, TransportServerBuilder};
+use plexus_rpc::auth_core::adapters::Carriers;
+use plexus_rpc::core::plexus::Activation;
+use plexus_rpc::transport::{ProtectedResource, TransportServerBuilder};
 
 use crate::access::{Branding, LoginAccess};
 use crate::client_ip::TrustedProxies;

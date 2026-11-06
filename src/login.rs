@@ -30,8 +30,8 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use plexus_auth_core::adapters::{Carriers, ClaimMap, KeyProofAdapter, Nip98Adapter, OidcAdapter};
-use plexus_auth_core::identity::{Authenticator, AuthenticatorChain};
+use plexus_rpc::auth_core::adapters::{Carriers, ClaimMap, KeyProofAdapter, Nip98Adapter, OidcAdapter};
+use plexus_rpc::auth_core::identity::{Authenticator, AuthenticatorChain};
 
 /// How an offered provider proves a caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +154,7 @@ impl Provider {
     pub fn sign_out_url(&self, session_id: &str, return_to: &str) -> Option<String> {
         match self {
             Self::WorkOs { base, .. } if session_id.starts_with("session_") => {
-                let base = base.as_deref().unwrap_or(plexus_auth_core::adapters::WORKOS_API).trim_end_matches('/');
+                let base = base.as_deref().unwrap_or(plexus_rpc::auth_core::adapters::WORKOS_API).trim_end_matches('/');
                 let mut url = url::Url::parse(&format!("{base}/user_management/sessions/logout")).ok()?;
                 url.query_pairs_mut().append_pair("session_id", session_id).append_pair("return_to", return_to);
                 Some(url.to_string())
@@ -263,7 +263,7 @@ impl FromStr for Provider {
                     if base.as_deref().is_some_and(|b| url::Url::parse(b).is_err()) {
                         return Err(format!("`{spec}`: the API base is not a URL; {usage}"));
                     }
-                    let api = base.as_deref().unwrap_or(plexus_auth_core::adapters::WORKOS_API).trim_end_matches('/');
+                    let api = base.as_deref().unwrap_or(plexus_rpc::auth_core::adapters::WORKOS_API).trim_end_matches('/');
                     Ok(Self::WorkOs { issuer: format!("{api}/user_management/{client}"), client: client.clone(), base })
                 }
                 _ => Err(format!("`{spec}`: a WorkOS client id is client_…; {usage}")),

@@ -17,7 +17,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use plexus_auth_core::identity::{Authenticator, Presentation};
+use plexus_rpc::auth_core::identity::{Authenticator, Presentation};
 use serde_json::Value;
 
 use crate::identity::{Capabilities, IdResult, IdentityBackend, IdentityError, RequestInfo, Secret, SignedIn, TokenSet, UserInfo};

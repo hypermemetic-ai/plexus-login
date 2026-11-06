@@ -45,9 +45,9 @@ use axum::extract::{Form, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
-use plexus_auth_core::adapters::Nip98Adapter;
-use plexus_auth_core::identity::{Authenticator, Presentation};
-use plexus_core::plexus::AuthContext;
+use plexus_rpc::auth_core::adapters::Nip98Adapter;
+use plexus_rpc::auth_core::identity::{Authenticator, Presentation};
+use plexus_rpc::core::plexus::AuthContext;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -869,7 +869,7 @@ pub(crate) fn named_by(ctx: &mut AuthContext, provider: &str, response: &Value) 
     let Some(user) = response.get("user") else { return };
     let s = |k: &str| user.get(k).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty());
     let Some(id) = s("id") else { return };
-    let ours = plexus_auth_core::identity::Principal::oidc(provider, id).ok();
+    let ours = plexus_rpc::auth_core::identity::Principal::oidc(provider, id).ok();
     if ours.is_none() || ctx.principal() != ours {
         return;
     }
@@ -988,8 +988,8 @@ fn nip98_detail(token: &str) -> String {
 }
 
 /// Why a NIP-98 event was refused, for the person who signed it.
-fn nostr_refusal(e: &plexus_auth_core::identity::AuthnRejection, app: &str) -> String {
-    use plexus_auth_core::identity::AuthnRejection as R;
+fn nostr_refusal(e: &plexus_rpc::auth_core::identity::AuthnRejection, app: &str) -> String {
+    use plexus_rpc::auth_core::identity::AuthnRejection as R;
     match e {
         R::Expired => format!("The signature is too old: {app} takes one signed within a minute. Press the button again and approve it promptly."),
         R::Malformed(m) if m.contains("already used") => "That signature was already used. Press the button again.".into(),
@@ -1498,7 +1498,7 @@ mod tests {
 
     #[test]
     fn the_response_names_only_the_token_s_own_subject() {
-        use plexus_auth_core::identity::{Authenticated, Principal};
+        use plexus_rpc::auth_core::identity::{Authenticated, Principal};
         let ctx = || {
             let p = Principal::oidc("workos", "user_01ADA").unwrap();
             Authenticated::new(p, "session_01ADA", vec![], json!({ "name": "user_01ADA", "provider": "workos" })).into_auth_context()

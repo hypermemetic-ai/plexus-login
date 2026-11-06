@@ -22,7 +22,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use plexus_auth_core::identity::{Authenticated, Principal};
+use plexus_rpc::auth_core::identity::{Authenticated, Principal};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 

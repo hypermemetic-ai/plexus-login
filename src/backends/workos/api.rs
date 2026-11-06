@@ -322,7 +322,7 @@ impl WorkOsApi {
     /// The API at `base` (`https://api.workos.com` unless given) for
     /// `client_id`, calling with `key`.
     pub fn new(base: Option<&str>, client_id: &str, key: ApiKey) -> anyhow::Result<Self> {
-        let base = base.unwrap_or(plexus_auth_core::adapters::WORKOS_API).trim_end_matches('/').to_string();
+        let base = base.unwrap_or(plexus_rpc::auth_core::adapters::WORKOS_API).trim_end_matches('/').to_string();
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(15))
