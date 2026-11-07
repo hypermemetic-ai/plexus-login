@@ -33,6 +33,7 @@ use plexus_rpc::core::plexus::Activation;
 use plexus_rpc::transport::{ProtectedResource, TransportServerBuilder};
 
 use crate::access::{Branding, LoginAccess};
+use crate::admission::Allow;
 use crate::client_ip::TrustedProxies;
 use crate::identity::IdentityBackend;
 use crate::throttle::Limits;
@@ -126,6 +127,11 @@ pub struct LoginOptions {
     /// DIST-14: one-time sign-in links ([`crate::once`]) — the app's, on a
     /// shell it serves on loopback alone; none elsewhere.
     pub once: Option<Arc<dyn crate::once::OnceLinks>>,
+    /// SUPERCONDUCTOR-25: `--allow` — who may have a session
+    /// ([`crate::admission`]: `github:<numeric id>`, `principal:<p>`).
+    /// Checked before every browser session is made, and at the socket for
+    /// a provider's bearer. Empty (the default): everyone, as before.
+    pub allow: Allow,
 }
 
 impl std::fmt::Debug for LoginOptions {
@@ -136,6 +142,7 @@ impl std::fmt::Debug for LoginOptions {
             .field("public_url", &self.public_url)
             .field("trusted_proxies", &self.trusted_proxies)
             .field("require", &self.require)
+            .field("allow", &self.allow.to_string())
             .finish_non_exhaustive()
     }
 }
@@ -172,7 +179,15 @@ impl LoginOptions {
             shell_loopback: true,
             workos_key: None,
             once: None,
+            allow: Allow::everyone(),
         }
+    }
+
+    /// SUPERCONDUCTOR-25: the same, admitting only whom `allow` names
+    /// ([`Allow::parse`] of the app's `--allow` flags).
+    pub fn allowing(mut self, allow: Allow) -> Self {
+        self.allow = allow;
+        self
     }
 
     /// The same, admitting callers through these `--auth-provider` specs.
@@ -315,6 +330,7 @@ impl Wiring {
                     trusted_proxies: opts.trusted_proxies.clone(),
                     return_origins: opts.return_origins.clone(),
                     limits: opts.limits,
+                    allow: opts.allow.clone(),
                 },
                 sessions.clone(),
             )?.with_once(opts.once.clone())))
@@ -332,7 +348,10 @@ impl Wiring {
         // AUTH-7: the gate notices who signs in holding nothing.
         // AUTH-22: with only an identity backend (no provider of its own,
         // e.g. `memory`), the gate still reads the session cookie.
-        let gate = (carriers.is_some() || login_on).then(|| Arc::new(Gate::new(sessions.clone(), carriers).noticing(access.clone())));
+        // SUPERCONDUCTOR-25: a provider's bearer at the socket takes the
+        // allow list too (only a `principal:` rule admits one).
+        let allow = Arc::new(opts.allow.clone());
+        let gate = (carriers.is_some() || login_on).then(|| Arc::new(Gate::new(sessions.clone(), carriers).noticing(access.clone()).admitting(allow)));
         // RFC 9728's metadata names the OIDC issuers a client can sign in at.
         let issuers: Vec<String> = opts.providers.iter().filter_map(|p| p.oidc().map(|(issuer, _, _)| issuer.to_string())).collect();
         // RUN-9: behind an https proxy, the socket the public reaches.

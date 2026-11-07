@@ -742,11 +742,25 @@ pub struct Gate {
     /// as it opens the socket — the gate refuses its calls before any method
     /// could notice it. SCAFFOLD-3: the app's [`LoginAccess::notice`].
     notice: Option<Notice>,
+    /// SUPERCONDUCTOR-25: the allow list, for identities a provider's bearer
+    /// proves ([`crate::admission::Allow::admits_bearer`]).
+    allow: Arc<crate::admission::Allow>,
 }
 
 impl Gate {
     pub fn new(sessions: Arc<Sessions>, carriers: Option<Arc<Carriers>>) -> Self {
-        Self { sessions, carriers, notice: None }
+        Self { sessions, carriers, notice: None, allow: Arc::default() }
+    }
+
+    /// SUPERCONDUCTOR-25: with rules, an identity a provider's bearer
+    /// proves (a WorkOS access token, any OIDC token, a nostr event) is
+    /// admitted only by a `principal:` rule naming it — no GitHub lookup is
+    /// made per connection, so `github:` rules never admit a bearer. `key:`
+    /// principals, session cookies and minted tokens are unaffected (a
+    /// session was admitted when it was made).
+    pub fn admitting(mut self, allow: Arc<crate::admission::Allow>) -> Self {
+        self.allow = allow;
+        self
     }
 
     /// AUTH-7: a sign-in holding no grant waits for an admin
@@ -766,10 +780,15 @@ impl Gate {
         if let Some(token) = minted_token(value) {
             return self.sessions.get(token);
         }
-        match &self.carriers {
-            Some(c) => c.validate(value).await,
-            None => None,
+        let ctx = match &self.carriers {
+            Some(c) => c.validate(value).await?,
+            None => return None,
+        };
+        if !self.allow.admits_bearer(&ctx) {
+            tracing::warn!(principal = %ctx.principal().map(|p| p.to_string()).unwrap_or_default(), "a bearer refused at the socket: not on the allow list");
+            return None;
         }
+        Some(ctx)
     }
 }
 

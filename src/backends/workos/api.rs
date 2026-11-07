@@ -14,6 +14,7 @@
 //! | [`WorkOsApi::factors`] | `GET /user_management/users/{id}/auth_factors` |
 //! | [`WorkOsApi::delete_factor`] | `DELETE /auth/factors/{id}` |
 //! | [`WorkOsApi::revoke_session`] | `POST /user_management/sessions/revoke` |
+//! | [`WorkOsApi::identities`] | `GET /user_management/users/{id}/identities` |
 //!
 //! Nothing here logs. The key is an [`ApiKey`], whose `Debug` prints no
 //! secret; answers that carry a secret (a Magic Auth code, a TOTP secret, a
@@ -301,6 +302,16 @@ pub struct Factor {
     pub created_at: Option<String>,
 }
 
+/// SUPERCONDUCTOR-25: an identity linked to a user: `provider`
+/// `GitHubOAuth`, `idp_id` the GitHub account's numeric id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub idp_id: String,
+    /// `OAuth`.
+    pub kind: String,
+    pub provider: String,
+}
+
 /// One WorkOS environment's client, with its key. See the module docs.
 pub struct WorkOsApi {
     base: String,
@@ -519,6 +530,25 @@ impl WorkOsApi {
             return Err(CallError::Unavailable("email_verification: an answer without a user".into()));
         };
         self.expect_ok(reqwest::Method::POST, &format!("/user_management/users/{}/email_verification/send", enc(user)), Some(json!({}))).await.map(|_| ())
+    }
+
+    /// SUPERCONDUCTOR-25: the OAuth identities linked to `user`
+    /// (`GET /user_management/users/{id}/identities`): a JSON array of
+    /// `{ idp_id, type, provider }` (a `{ data: [...] }` list is read too).
+    /// An answer that is neither is a failure, not an empty list.
+    pub async fn identities(&self, user: &str) -> Result<Vec<Identity>, CallError> {
+        let v = self.expect_ok(reqwest::Method::GET, &format!("/user_management/users/{}/identities", enc(user)), None).await?;
+        let list = match &v {
+            Value::Array(a) => a,
+            other => other.get("data").and_then(Value::as_array).ok_or_else(|| CallError::Unavailable("identities: an answer that is not a list".into()))?,
+        };
+        Ok(list
+            .iter()
+            .filter_map(|i| {
+                let s = |k: &str| i.get(k).and_then(Value::as_str).map(str::to_string);
+                Some(Identity { idp_id: s("idp_id")?, kind: s("type").unwrap_or_default(), provider: s("provider")? })
+            })
+            .collect())
     }
 
     /// Ends a WorkOS session (`sid`).

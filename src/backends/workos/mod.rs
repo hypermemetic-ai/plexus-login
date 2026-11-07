@@ -14,6 +14,7 @@
 //! | `totp_factors` / `totp_remove` / `totp_discard` | `GET /user_management/users/{id}/auth_factors`; `POST /auth/factors/{id}/challenge` + verify; `DELETE /auth/factors/{id}` |
 //! | `refresh` | `authenticate`, grant `refresh_token` |
 //! | `sign_out` | `POST /user_management/sessions/revoke` |
+//! | `github_id` | SUPERCONDUCTOR-25: `GET /user_management/users/{id}/identities`, the `GitHubOAuth` one's `idp_id` |
 //!
 //! Every authenticate call carries the client id, the API key as
 //! `client_secret`, and the person's IP and user agent. Every documented
@@ -347,6 +348,17 @@ impl IdentityBackend for WorkOs {
         match &tokens.session {
             Some(s) => self.api.revoke_session(s).await.map_err(call),
             None => Ok(()),
+        }
+    }
+
+    /// SUPERCONDUCTOR-25: the `GitHubOAuth` identity's `idp_id` — GitHub's
+    /// numeric user id. A user not found, or an id that is not a number, is
+    /// a failure (the caller refuses), never "none linked".
+    async fn github_id(&self, subject: &str) -> IdResult<Option<u64>> {
+        let ids = self.api.identities(subject).await.map_err(call)?;
+        match ids.iter().find(|i| i.provider == "GitHubOAuth") {
+            None => Ok(None),
+            Some(i) => i.idp_id.trim().parse::<u64>().map(Some).map_err(|_| IdentityError::Unavailable("a GitHub identity whose idp_id is not a number".into())),
         }
     }
 }

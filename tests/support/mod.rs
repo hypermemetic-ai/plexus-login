@@ -25,7 +25,7 @@ use plexus_login::identity::{IdentityBackend, Social};
 use plexus_login::simple::SimpleAccess;
 use plexus_login::throttle::Limits;
 use plexus_login::web_login::Login;
-use plexus_login::{Branding, LoginOptions, Wiring};
+use plexus_login::{Allow, Branding, LoginOptions, Wiring};
 use plexus_rpc::transport::TransportServer;
 use serde_json::{json, Value};
 
@@ -259,11 +259,13 @@ pub struct Tweaks {
     pub trusted: Vec<&'static str>,
     pub limits: Limits,
     pub return_origins: Vec<String>,
+    /// SUPERCONDUCTOR-25: the allow list.
+    pub allow: Allow,
 }
 
 impl Default for Tweaks {
     fn default() -> Self {
-        Self { trusted: vec![], limits: Limits::default(), return_origins: vec!["https://app.example".into()] }
+        Self { trusted: vec![], limits: Limits::default(), return_origins: vec!["https://app.example".into()], allow: Allow::everyone() }
     }
 }
 
@@ -281,6 +283,7 @@ pub async fn app_with(under: Under, t: Tweaks) -> App {
         trusted_proxies: TrustedProxies::parse(t.trusted).unwrap(),
         limits: t.limits,
         return_origins: t.return_origins,
+        allow: t.allow,
         allow_development_backends: true,
         ..LoginOptions::new(BRANDING, ws, shell_port)
     };
@@ -309,6 +312,11 @@ pub async fn app_with(under: Under, t: Tweaks) -> App {
 /// backend on the app's own page. `under` is the fake and the backend the
 /// wiring made (without a key, a backend no page uses).
 pub async fn app_direct(key: Option<&str>, buttons: &[&str]) -> (App, FakeWorkOs) {
+    app_direct_allowing(key, buttons, Allow::everyone()).await
+}
+
+/// SUPERCONDUCTOR-25: [`app_direct`], admitting only whom `allow` names.
+pub async fn app_direct_allowing(key: Option<&str>, buttons: &[&str], allow: Allow) -> (App, FakeWorkOs) {
     capture_logs();
     let fake = FakeWorkOs::start().await;
     let ws = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
@@ -318,6 +326,7 @@ pub async fn app_direct(key: Option<&str>, buttons: &[&str]) -> (App, FakeWorkOs
         buttons: buttons.iter().map(|b| b.parse().unwrap()).collect(),
         workos_key: key.map(|k| ApiKey::new(k).unwrap()),
         require: true,
+        allow,
         ..LoginOptions::new(BRANDING, ws, shell_port).with_providers([format!("workos={},{}", fake_workos::CLIENT, fake.base)]).unwrap()
     };
     let wiring = Wiring::new(opts).unwrap();

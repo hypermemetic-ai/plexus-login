@@ -21,6 +21,12 @@
 //! verified domain with an active OktaSAML connection; `pending.example`
 //! has an active connection but an unverified domain; `nossoconn.example`
 //! is verified with no connection.
+//!
+//! SUPERCONDUCTOR-25: `GET /user_management/users/{id}/identities` answers
+//! a `GitHubOAuth` identity for an address in `github_ids` (its numeric id as
+//! `idp_id`), none otherwise; 503 while `identities_unavailable`. The
+//! authorization-code grant also takes a public client's PKCE exchange (a
+//! form, no secret), as AuthKit's round trip makes it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -77,6 +83,10 @@ pub struct FakeState {
     pub revoke_delay_ms: u64,
     /// `refresh_token` answers 503.
     pub refresh_unavailable: bool,
+    /// SUPERCONDUCTOR-25: the GitHub numeric id linked to an address.
+    pub github_ids: HashMap<String, u64>,
+    /// SUPERCONDUCTOR-25: the identities endpoint answers 503.
+    pub identities_unavailable: bool,
     iss: String,
 }
 
@@ -111,6 +121,7 @@ impl FakeWorkOs {
             .route("/user_management/sessions/revoke", post(revoke))
             .route("/user_management/email_verification/{id}", get(get_verification))
             .route("/user_management/users/{id}/email_verification/send", post(send_verification))
+            .route("/user_management/users/{id}/identities", get(identities))
             .with_state(w.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         w
@@ -148,6 +159,27 @@ impl FakeWorkOs {
 
     pub fn issued(&self) -> Vec<String> {
         self.state.lock().unwrap().issued.clone()
+    }
+
+    /// SUPERCONDUCTOR-25: an access token for `email`, as WorkOS issues one
+    /// (a CLI holding it would present it at the socket as a bearer).
+    pub fn access_token_for(&self, email: &str) -> String {
+        let mut st = self.state.lock().unwrap();
+        let user = user_json(&mut st, email);
+        st.n += 1;
+        let mut h = Header::new(Algorithm::RS256);
+        h.kid = Some("fake-1".into());
+        let claims = json!({ "iss": st.iss, "sub": user["id"], "sid": format!("session_{:04}", st.n), "jti": format!("jti{}", st.n), "client_id": CLIENT, "exp": now() + 300, "iat": now() - 5 });
+        encode(&h, &claims, &EncodingKey::from_rsa_pem(KEY_PEM.as_bytes()).unwrap()).unwrap()
+    }
+
+    /// The WorkOS user id `email` has (made now if new).
+    pub fn user_id_of(&self, email: &str) -> String {
+        user_id(&mut self.state.lock().unwrap(), email)
+    }
+
+    pub fn revoked(&self) -> Vec<String> {
+        self.state.lock().unwrap().revoked.iter().cloned().collect()
     }
 
     pub fn revoke_all_sessions(&self) {
@@ -269,11 +301,16 @@ fn success(st: &mut FakeState, email: &str, sid: Option<String>, method: &str) -
     Json(json!({ "user": user, "organization_id": null, "access_token": token, "refresh_token": refresh, "authentication_method": method })).into_response()
 }
 
-async fn authenticate(State(w): State<FakeWorkOs>, Json(b): Json<Value>) -> Response {
+async fn authenticate(State(w): State<FakeWorkOs>, body: axum::body::Bytes) -> Response {
+    // JSON from the backend; a form from a public client's PKCE exchange.
+    let b: Value = serde_json::from_slice(&body).unwrap_or_else(|_| {
+        Value::Object(url::form_urlencoded::parse(&body).map(|(k, v)| (k.into_owned(), Value::String(v.into_owned()))).collect())
+    });
     let bad = |v: Value| (StatusCode::BAD_REQUEST, Json(v)).into_response();
     let mut st = w.state.lock().unwrap();
     st.auths.push(b.clone());
-    if b["client_id"] != CLIENT || b["client_secret"] != KEY {
+    let pkce = b["grant_type"] == "authorization_code" && b.get("client_secret").is_none() && b["code_verifier"].is_string();
+    if b["client_id"] != CLIENT || (b["client_secret"] != KEY && !pkce) {
         return bad(json!({ "error": "invalid_client", "error_description": "Invalid client secret." }));
     }
     let s = |k: &str| b[k].as_str().unwrap_or_default().to_string();
@@ -505,4 +542,20 @@ async fn send_verification(State(w): State<FakeWorkOs>, h: HeaderMap, Path(user)
     st.calls.push("email_verification_send".into());
     st.verification_sends.push(user.clone());
     Json(json!({ "user": { "object": "user", "id": user, "email": "verify@example.test", "email_verified": false } })).into_response()
+}
+
+async fn identities(State(w): State<FakeWorkOs>, h: HeaderMap, Path(user): Path<String>) -> Response {
+    if !bearer_ok(&h) {
+        return unauthorized();
+    }
+    let mut st = w.state.lock().unwrap();
+    st.calls.push(format!("identities:{user}"));
+    if st.identities_unavailable {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "message": "unavailable" }))).into_response();
+    }
+    let Some(email) = st.users.iter().find(|(_, id)| **id == user).map(|(e, _)| e.clone()) else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "code": "entity_not_found" }))).into_response();
+    };
+    let list: Vec<Value> = st.github_ids.get(&email).map(|id| json!({ "idp_id": id.to_string(), "type": "OAuth", "provider": "GitHubOAuth" })).into_iter().collect();
+    Json(Value::Array(list)).into_response()
 }

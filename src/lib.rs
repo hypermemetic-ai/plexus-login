@@ -7,6 +7,7 @@
 //! | module | what it is |
 //! | --- | --- |
 //! | [`wiring`] | [`Wiring`] / [`Wired`]: the whole login in two calls — the gate, the anonymous view, the page's router, the auth backend |
+//! | [`admission`] | SUPERCONDUCTOR-25: [`Allow`], who may have a session (`github:<id>`, `principal:<p>`), checked before every browser session and at the socket |
 //! | [`access`] | the seam: [`LoginAccess`], what the app implements; [`Branding`] |
 //! | [`simple`] | [`simple::SimpleAccess`]: ready-made in-memory rules, roles global |
 //! | [`names`] | [`LoginNames`]: the cookies and the session metadata key, the app's |
@@ -25,6 +26,7 @@
 //! README.md has the walk-through.
 
 pub mod access;
+pub mod admission;
 pub mod app_session;
 pub mod auth_backend;
 pub mod backends;
@@ -45,6 +47,7 @@ pub mod web_login;
 pub mod wiring;
 
 pub use access::{Branding, LoginAccess};
+pub use admission::Allow;
 pub use identity::{Capabilities, IdentityBackend, IdentityError};
 pub use names::LoginNames;
 pub use wiring::{LoginOptions, Wired, Wiring};

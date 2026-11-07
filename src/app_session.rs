@@ -34,6 +34,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
+use crate::admission::{self, Allow, NOT_ALLOWED};
 use crate::identity::{IdentityBackend, IdentityError, RequestInfo, SignedIn, TokenSet};
 use crate::page::{self, Body, Chrome};
 use crate::sessions::{self, now, Sessions};
@@ -212,14 +213,37 @@ pub struct AppContinuation {
     pub chrome: Chrome,
     /// Over https: `Secure` cookies.
     pub secure: bool,
+    /// SUPERCONDUCTOR-25: who may have a session ([`crate::admission`]);
+    /// empty, everyone.
+    pub allow: Arc<Allow>,
+}
+
+impl AppContinuation {
+    /// SUPERCONDUCTOR-25: the page that says this account isn't allowed: no
+    /// session, no cookie.
+    fn not_allowed(&self) -> Response {
+        let main = r#"<p class="note"><a href="/login">Back to sign-in</a></p>"#.to_string();
+        page::respond(StatusCode::FORBIDDEN, self.draw(Body { heading: page::heading("Sign in", "to continue"), error: Some(NOT_ALLOWED.into()), main, alts: String::new(), extra: String::new() }))
+    }
 }
 
 #[async_trait]
 impl Continuation for AppContinuation {
     async fn signed_in(&self, who: SignedIn, backend: Arc<dyn IdentityBackend>, next: &str) -> Response {
         let principal = who.ctx.principal().map(|p| p.to_string()).unwrap_or_default();
+        // SUPERCONDUCTOR-25: no session for anyone the allow list refuses;
+        // their session at the backend is ended, best effort.
+        let admitted = match admission::admit(&self.allow, who.ctx, Some(&backend)).await {
+            Ok(a) => a,
+            Err(_) => {
+                if let Some(tokens) = who.tokens {
+                    tokio::spawn(revoke(Held { tokens, principal, backend }));
+                }
+                return self.not_allowed();
+            }
+        };
         // FRAME-21: a session that could not be kept is not handed out.
-        let (id, expires) = match self.sessions.create(who.ctx) {
+        let (id, expires) = match self.sessions.create(admitted.into_inner()) {
             Ok(kept) => kept,
             Err(e) => return sessions::not_kept(e),
         };

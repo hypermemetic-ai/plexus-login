@@ -53,6 +53,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::access::{Branding, LoginAccess};
+use crate::admission::{self, Admitted, Allow, NOT_ALLOWED};
 use crate::app_session::{AppContinuation, TokenStore};
 use crate::client_ip::{peer_ip, Peer, TrustedProxies};
 use crate::dev_login::{self, DevLogin};
@@ -105,6 +106,10 @@ pub struct LoginConfig<A: LoginAccess> {
     pub return_origins: Vec<String>,
     /// AUTH-22: the sign-in's throttles.
     pub limits: Limits,
+    /// SUPERCONDUCTOR-25: who may have a session ([`crate::admission`]):
+    /// every way in here takes it before a session is made. Empty
+    /// (default), everyone.
+    pub allow: Allow,
 }
 
 /// The email field's button, as `/login/start?button=` names it.
@@ -146,6 +151,8 @@ pub struct Login<A: LoginAccess> {
     trusted: TrustedProxies,
     /// DIST-14: the app's one-time sign-in links, when it has them.
     once: Option<Arc<dyn crate::once::OnceLinks>>,
+    /// SUPERCONDUCTOR-25: the allow list.
+    allow: Arc<Allow>,
 }
 
 impl<A: LoginAccess> Login<A> {
@@ -213,6 +220,10 @@ impl<A: LoginAccess> Login<A> {
         let return_to = ReturnTo::new(origins.iter().chain(cfg.return_origins.iter()));
         let secure = public_url.starts_with("https://");
         let (throttles, trusted) = (Throttles::new(cfg.limits), cfg.trusted_proxies.clone());
+        let allow = Arc::new(cfg.allow);
+        if !allow.is_empty() {
+            tracing::info!(allow = %allow, "Sign-in:   only the allow list gets a session");
+        }
         let (signin, tokens) = match cfg.identity {
             Some(backend) => {
                 let tokens = TokenStore::new(sessions.clone());
@@ -233,7 +244,7 @@ impl<A: LoginAccess> Login<A> {
                     dev_toggle: String::new(),
                     service_worker: cfg.service_worker.map(str::to_string),
                 };
-                let cont = Arc::new(AppContinuation { sessions: sessions.clone(), tokens: tokens.clone(), chrome, secure });
+                let cont = Arc::new(AppContinuation { sessions: sessions.clone(), tokens: tokens.clone(), chrome, secure, allow: allow.clone() });
                 let page = SignInPage::new(
                     PageConfig {
                         backend,
@@ -276,6 +287,7 @@ impl<A: LoginAccess> Login<A> {
             throttles,
             trusted,
             once: None,
+            allow,
         })
     }
 
@@ -392,15 +404,50 @@ impl<A: LoginAccess> Login<A> {
                 .is_some_and(|v| v == "1")
     }
 
-    /// A session for an identity, and the response that hands it over.
-    fn sign_in(&self, ctx: AuthContext, next: &str) -> Response {
-        self.hand_over(ctx, see_other(next))
+    /// A session for an identity the allow list admits, and the response
+    /// that hands it over; else the page that says it isn't allowed.
+    async fn sign_in(&self, ctx: AuthContext, next: &str) -> Response {
+        match self.admit(ctx).await {
+            Some(who) => self.hand_over(who, see_other(next)),
+            None => self.not_allowed(),
+        }
     }
 
-    /// A session for an identity, its cookies set on `r`.
-    fn hand_over(&self, ctx: AuthContext, mut r: Response) -> Response {
+    /// SUPERCONDUCTOR-25: the allow list's verdict ([`admission::admit`]):
+    /// the GitHub id asked of our own page's backend when it is WorkOS's.
+    /// A refused WorkOS sign-in's session there is ended, best effort.
+    async fn admit(&self, ctx: AuthContext) -> Option<Admitted> {
+        if self.allow.is_empty() {
+            return admission::admit(&self.allow, ctx, None).await.ok();
+        }
+        let backend = self.signin.as_ref().map(|p| p.backend());
+        let session = Some(ctx.session_id.clone()).filter(|s| s.starts_with("session_"));
+        match admission::admit(&self.allow, ctx, backend.as_ref()).await {
+            Ok(who) => Some(who),
+            Err(_) => {
+                if let (Some(b), Some(s)) = (backend.filter(|b| b.name() == "workos"), session) {
+                    let tokens = crate::identity::TokenSet { access: crate::identity::Secret(String::new()), refresh: None, session: Some(s), expires_at: 0 };
+                    tokio::spawn(async move {
+                        if let Err(e) = b.sign_out(&tokens).await {
+                            tracing::warn!(kind = e.kind(), "a refused sign-in's WorkOS session could not be ended");
+                        }
+                    });
+                }
+                None
+            }
+        }
+    }
+
+    /// SUPERCONDUCTOR-25: the page that says this account isn't allowed:
+    /// no session, no cookie.
+    fn not_allowed(&self) -> Response {
+        page_response(self, "/", Some(NOT_ALLOWED), StatusCode::FORBIDDEN)
+    }
+
+    /// A session for an admitted identity, its cookies set on `r`.
+    fn hand_over(&self, who: Admitted, mut r: Response) -> Response {
         // FRAME-21: a session that could not be kept is not handed out.
-        let (id, expires) = match self.sessions.create(ctx) {
+        let (id, expires) = match self.sessions.create(who.into_inner()) {
             Ok(kept) => kept,
             Err(e) => return sessions::not_kept(e),
         };
@@ -641,7 +688,7 @@ pub async fn page<A: LoginAccess>(State(login): State<Arc<Login<A>>>, headers: H
         if crate::client_ip::peer_ip(&peer).is_some_and(|ip| ip.is_loopback()) {
             let next = safe_next(q.next.as_deref());
             return match once.redeem(token) {
-                Some(ctx) => login.sign_in(ctx, &next),
+                Some(ctx) => login.sign_in(ctx, &next).await,
                 None => login.page_view(Some(&headers), &next, Some(&once.spent()), false, false, StatusCode::FORBIDDEN),
             };
         }
@@ -689,7 +736,7 @@ pub async fn password<A: LoginAccess>(State(login): State<Arc<Login<A>>>, header
     let answer = login.password_grant(&name, &f.username, &f.password).await;
     login.throttles.settle(reserved, guess_outcome(&answer));
     match answer {
-        Ok(ctx) => login.sign_in(ctx, &next),
+        Ok(ctx) => login.sign_in(ctx, &next).await,
         Err(e) => page_response(&login, &next, Some(&e), StatusCode::UNAUTHORIZED),
     }
 }
@@ -856,7 +903,7 @@ pub async fn callback<A: LoginAccess>(State(login): State<Arc<Login<A>>>, header
         Ok::<_, String>(ctx)
     };
     match attempt.await {
-        Ok(ctx) => login.sign_in(ctx, &pending.next),
+        Ok(ctx) => login.sign_in(ctx, &pending.next).await,
         Err(e) => fail(&e),
     }
 }
@@ -935,8 +982,11 @@ pub async fn nostr<A: LoginAccess>(State(login): State<Arc<Login<A>>>, headers: 
         Err(e) => tracing::warn!("nostr sign-in refused: {e} — {detail}"),
     }
     match outcome {
-        Ok(a) if json => login.hand_over(a.into_auth_context(), axum::Json(json!({ "next": next })).into_response()),
-        Ok(a) => login.sign_in(a.into_auth_context(), &next),
+        Ok(a) if json => match login.admit(a.into_auth_context()).await {
+            Some(who) => login.hand_over(who, axum::Json(json!({ "next": next })).into_response()),
+            None => (StatusCode::FORBIDDEN, axum::Json(json!({ "error": NOT_ALLOWED }))).into_response(),
+        },
+        Ok(a) => login.sign_in(a.into_auth_context(), &next).await,
         Err(e) if json => (StatusCode::UNAUTHORIZED, axum::Json(json!({ "error": nostr_refusal(&e, login.branding.app) }))).into_response(),
         Err(_) => (StatusCode::UNAUTHORIZED, "the nostr event was not accepted").into_response(),
     }
@@ -1024,7 +1074,7 @@ pub async fn dev<A: LoginAccess>(State(login): State<Arc<Login<A>>>, headers: He
     // A plexus-idp account by its own password: exactly that account.
     if let Some(pw) = f.password.as_deref().filter(|p| !p.is_empty()) {
         return match login.password_grant(&d.provider, f.user.trim(), pw).await {
-            Ok(ctx) => login.sign_in(ctx, &next),
+            Ok(ctx) => login.sign_in(ctx, &next).await,
             Err(e) => refuse(&e, StatusCode::UNAUTHORIZED),
         };
     }
@@ -1074,7 +1124,7 @@ pub async fn dev<A: LoginAccess>(State(login): State<Arc<Login<A>>>, headers: He
         return refuse(&format!("{name} signed in, but its grants failed: {e}"), StatusCode::INTERNAL_SERVER_ERROR);
     }
     tracing::info!(user = %name, %principal, grants = %dev_login::describe(&grants), "dev sign-in");
-    login.sign_in(ctx, &next)
+    login.sign_in(ctx, &next).await
 }
 
 /// The dev sign-in's panel: the roster, anyone, an account's own password.

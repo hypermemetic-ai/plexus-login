@@ -394,4 +394,11 @@ pub trait IdentityBackend: Send + Sync + 'static {
     async fn sign_out(&self, _tokens: &TokenSet) -> IdResult<()> {
         Ok(())
     }
+
+    /// SUPERCONDUCTOR-25: the numeric id of the GitHub account linked to
+    /// `subject` (the backend's user), for a `github:` allow rule
+    /// ([`crate::admission`]); `Ok(None)` when none is linked.
+    async fn github_id(&self, _subject: &str) -> IdResult<Option<u64>> {
+        unsupported("linked identities")
+    }
 }
