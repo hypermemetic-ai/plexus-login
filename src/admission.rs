@@ -6,6 +6,7 @@
 //! | --- | --- |
 //! | `github:<numeric id>` | a WorkOS sign-in whose linked GitHub identity has that id (WorkOS's `GET /user_management/users/{id}/identities`, the `GitHubOAuth` identity's `idp_id`) — the id, never the username, which can be renamed |
 //! | `principal:<principal>` | exactly that principal (`oidc:workos/user_…`, `nostr:<hex>`, `idp:<uuid>`, …) |
+//! | `github:<numeric id>=<principal>` | as `github:<id>`, and the session is made **as `<principal>`**: one person's second GitHub account signs in as the same principal as the first (its own principal kept as [`SIGNED_IN_AS`]) |
 //!
 //! - **No rule: nothing changes.** No lookup is made, nothing is refused —
 //!   every app that sets none (menger) behaves as before.
@@ -43,6 +44,10 @@ use crate::identity::IdentityBackend;
 /// The session metadata key the GitHub numeric id is kept under.
 pub const GITHUB_ID: &str = "github_id";
 
+/// The session metadata key a `github:<id>=<principal>` sign-in keeps the
+/// provider's own principal under.
+pub const SIGNED_IN_AS: &str = "signed_in_as";
+
 /// What a refused person is told.
 pub const NOT_ALLOWED: &str = "This account isn't allowed here.";
 
@@ -53,6 +58,9 @@ pub enum Rule {
     GitHub(u64),
     /// `principal:<principal>`: exactly this principal.
     Principal(Principal),
+    /// `github:<id>=<principal>`: a GitHub account by its numeric id, whose
+    /// session is made as `<principal>`.
+    GitHubAs(u64, Principal),
 }
 
 impl FromStr for Rule {
@@ -60,7 +68,11 @@ impl FromStr for Rule {
 
     fn from_str(s: &str) -> Result<Self, String> {
         let s = s.trim();
-        let bad = |why: &str| format!("--allow {s}: {why}; an allow rule is github:<numeric id> or principal:<principal>");
+        let bad = |why: &str| format!("--allow {s}: {why}; an allow rule is github:<numeric id>, github:<numeric id>=<principal> or principal:<principal>");
+        if let Some((gh, as_)) = s.split_once('=') {
+            let Ok(Self::GitHub(id)) = gh.parse::<Self>() else { return Err(bad("only a github: rule can sign in as another principal")) };
+            return as_.trim().parse::<Principal>().map(|p| Self::GitHubAs(id, p)).map_err(|e| bad(&e.to_string()));
+        }
         match s.split_once(':') {
             Some(("github", id)) => match id.trim().parse::<u64>() {
                 Ok(n) if n > 0 && id.trim().bytes().all(|b| b.is_ascii_digit()) => Ok(Self::GitHub(n)),
@@ -77,6 +89,7 @@ impl fmt::Display for Rule {
         match self {
             Self::GitHub(id) => write!(f, "github:{id}"),
             Self::Principal(p) => write!(f, "principal:{p}"),
+            Self::GitHubAs(id, p) => write!(f, "github:{id}={p}"),
         }
     }
 }
@@ -126,7 +139,7 @@ impl Allow {
     /// Whether a `github:` rule is set (a WorkOS sign-in's GitHub id is
     /// fetched).
     pub fn wants_github(&self) -> bool {
-        self.rules.iter().any(|r| matches!(r, Rule::GitHub(_)))
+        self.rules.iter().any(|r| matches!(r, Rule::GitHub(_) | Rule::GitHubAs(..)))
     }
 
     /// Whether a rule names this identity: its principal, or the GitHub id
@@ -139,8 +152,18 @@ impl Allow {
         let principal = ctx.principal();
         let github = ctx.metadata.get(GITHUB_ID).and_then(Value::as_u64);
         self.rules.iter().any(|r| match r {
-            Rule::GitHub(id) => github == Some(*id),
+            Rule::GitHub(id) | Rule::GitHubAs(id, _) => github == Some(*id),
             Rule::Principal(p) => principal.as_ref() == Some(p),
+        })
+    }
+
+    /// The principal a `github:<id>=<principal>` rule makes this identity's
+    /// session as, when one names its fetched GitHub id.
+    pub fn signs_in_as(&self, ctx: &AuthContext) -> Option<&Principal> {
+        let github = ctx.metadata.get(GITHUB_ID).and_then(Value::as_u64)?;
+        self.rules.iter().find_map(|r| match r {
+            Rule::GitHubAs(id, p) if *id == github => Some(p),
+            _ => None,
         })
     }
 
@@ -240,6 +263,14 @@ pub async fn admit(allow: &Allow, mut ctx: AuthContext, backend: Option<&Arc<dyn
     }
     if allow.admits(&ctx) {
         tracing::info!(%principal, github_id = ?ctx.metadata.get(GITHUB_ID), "sign-in admitted by the allow list");
+        if let Some(as_) = allow.signs_in_as(&ctx).cloned() {
+            tracing::info!(%principal, signs_in_as = %as_, "the allow list makes this session as another principal");
+            if let Some(meta) = ctx.metadata.as_object_mut() {
+                meta.insert(SIGNED_IN_AS.into(), Value::String(principal.clone()));
+                meta.insert("principal".into(), Value::String(as_.to_string()));
+            }
+            ctx.user_id = as_.to_string();
+        }
         Ok(Admitted(ctx))
     } else {
         tracing::warn!(%principal, github_id = ?ctx.metadata.get(GITHUB_ID), "sign-in refused: not on the allow list");

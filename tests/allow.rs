@@ -219,3 +219,35 @@ async fn with_no_rules_nothing_changes_and_nothing_is_looked_up() {
     assert_eq!(fake.calls_starting("identities:"), 0, "no identities call");
     assert!(fake.revoked().is_empty());
 }
+
+/// The operator's second GitHub account: `github:<id>=<principal>` admits it
+/// and makes its session as the first account's principal, so what that
+/// principal owns (its hosts) is the second account's too.
+#[tokio::test]
+async fn a_second_github_account_signs_in_as_the_first_principal() {
+    const SECOND: &str = "second@example.test";
+    const SECOND_ID: u64 = 220071806;
+    let (a, fake) = page_app(allow()).await;
+    fake.state.lock().unwrap().github_ids.insert(SECOND.into(), SECOND_ID);
+    // Without the `=` rule the second account is refused.
+    let b = Browser::new(&a);
+    assert!(says_not_allowed(&github_as(&a, &fake, &b, SECOND).await));
+
+    let owner = "oidc:workos/user_01M4GTJS2WTGNCXY1ZSXNSDE7M";
+    let rules = Allow::parse([format!("github:{HYPERMEMETIC},github:{SECOND_ID}={owner}")]).unwrap();
+    assert_eq!(rules.to_string(), format!("github:{HYPERMEMETIC},github:{SECOND_ID}={owner}"));
+    let (a2, fake2) = page_app(rules).await;
+    fake2.state.lock().unwrap().github_ids.insert(SECOND.into(), SECOND_ID);
+    let b = Browser::new(&a2);
+    let r = github_as(&a2, &fake2, &b, SECOND).await;
+    assert_eq!((r.status, r.location.as_deref()), (303, Some("/app/x")), "{}", r.body);
+    let me = b.me().await.expect("signed in");
+    assert_eq!(me["principal"].as_str(), Some(owner), "the session is the first account's principal: {me}");
+    let ctx = session_of(&a2, owner).expect("a session as the owner");
+    let own = ctx.get_metadata_string(plexus_login::admission::SIGNED_IN_AS).expect("its own principal kept");
+    assert!(own.starts_with("oidc:workos/") && own != owner, "{own}");
+    assert_eq!(ctx.metadata[GITHUB_ID], json!(SECOND_ID));
+
+    // Only a github: rule can sign in as another principal.
+    assert!(Allow::parse([format!("principal:{owner}={owner}")]).is_err());
+}
