@@ -79,6 +79,39 @@ pub trait LoginAccess: Clone + Send + Sync + 'static {
     /// `None`: the rules keep no sessions (login off), so no identity
     /// carries one.
     fn session_key(&self) -> Option<&str>;
+
+    // ── acting as anyone (test only; [`crate::acting`]) ──
+    //
+    // Defaults answer nothing, so an app that implements none of these has
+    // no admin and nothing to give: acting refuses everyone.
+
+    /// Whether `principal` holds the app's admin role (acting is admin-only,
+    /// and an admin is never acted as).
+    fn is_admin(&self, _principal: &str) -> bool {
+        false
+    }
+
+    /// The roles `principal` holds, as `role@SCOPE`, for the people list.
+    fn held(&self, _principal: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The `(role, scope)` pairs a test user can be given — the create form's
+    /// choices. Admin roles ([`LoginAccess::is_admin_role`]) are left out.
+    fn grantable(&self) -> Vec<(Self::Role, String)> {
+        Vec::new()
+    }
+
+    /// Whether `role` is the app's admin role (default: its name is `admin`).
+    fn is_admin_role(role: &Self::Role) -> bool {
+        role.to_string().eq_ignore_ascii_case("admin")
+    }
+
+    /// Principals the app knows beyond the sessions standing (its members,
+    /// its waiting list), with a name when it has one.
+    fn known_users(&self) -> Vec<(String, Option<String>)> {
+        Vec::new()
+    }
 }
 
 /// What the login page says of the app it signs in to.

@@ -650,6 +650,57 @@ impl Sessions {
         self.used(key).is_some()
     }
 
+    /// Whether the session under `key` still stands *and still names*
+    /// `user_id`: a socket opened before the session was given another
+    /// identity ([`Sessions::replace`], acting as someone) is no longer its.
+    pub fn alive_as(&self, key: &str, user_id: &str) -> bool {
+        self.used(key).is_some_and(|c| c.user_id == user_id)
+    }
+
+    /// Whether the session under `key` is a browser's — made by
+    /// [`Sessions::create`] for the sign-in cookie — not a minted token.
+    pub fn is_browser(&self, key: &str) -> bool {
+        self.live.lock().unwrap().get(key).is_some_and(|s| s.idles)
+    }
+
+    /// The identity the session under `key` holds now, while it stands.
+    pub fn current(&self, key: &str) -> Option<AuthContext> {
+        self.used(key)
+    }
+
+    /// Gives the standing session under `key` another identity — the same
+    /// key (the browser keeps its cookie), expiry and idling — stamped as
+    /// [`Sessions::create`] stamps one. FRAME-21: journaled (a `start` row
+    /// under the same key, which a replay takes as the newer) before it
+    /// stands. `false`: no such session stands.
+    pub fn replace(&self, key: &str, mut ctx: AuthContext) -> io::Result<bool> {
+        let mut journal = self.journal.lock().unwrap();
+        let (ends, idles) = {
+            let live = self.live.lock().unwrap();
+            match live.map.get(key) {
+                Some((s, e, _)) if *e > now() => (*e, s.idles),
+                _ => return Ok(false),
+            }
+        };
+        if let Some(meta) = ctx.metadata.as_object_mut() {
+            meta.insert(self.names.session_key.clone(), key.into());
+            meta.insert("expires_at".into(), ends.into());
+        }
+        let t = now();
+        if let Some(j) = journal.as_mut() {
+            self.append(j, &[Row::Start { key: key.to_string(), ends, idles, seen: t, ctx: ctx.clone() }], true)?;
+        }
+        let mut live = self.live.lock().unwrap();
+        match live.map.get_mut(key) {
+            Some((s, _, _)) => {
+                s.ctx = ctx;
+                s.seen = t;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Keeps a login transaction for ten minutes; its state.
     pub fn begin(&self, provider: &str, verifier: String, next: String) -> String {
         let state = random_token();
@@ -810,6 +861,8 @@ impl SessionValidator for Gate {
         }
         match ctx.get_metadata_string(self.sessions.session_key()) {
             Some(key) if !self.sessions.alive(&key) => Err("you have signed out: sign in again".into()),
+            // Acting: the session now names someone else; this socket was the other.
+            Some(key) if !self.sessions.alive_as(&key, &ctx.user_id) => Err("this session now signs in as someone else: reconnect".into()),
             _ => Ok(()),
         }
     }

@@ -82,7 +82,7 @@ pub const MINT_TTL_MAX_SECS: u64 = 24 * 60 * 60;
 pub const WAITING_MAX: usize = 1000;
 
 /// The metadata a minted session keeps from the identity that asked for it.
-const KEPT_ON_MINT: &[&str] = &["principal", "agent", "name", "username", "provider", "auth_method", "org_id", "tenant_id", "email"];
+const KEPT_ON_MINT: &[&str] = &["principal", "agent", "name", "username", "provider", "auth_method", "org_id", "tenant_id", "email", "signed_in_as", "acting_as"];
 
 /// In-memory, global-role rules. See the module docs. Cheap to clone.
 #[derive(Clone)]
@@ -256,6 +256,7 @@ impl LoginAccess for SimpleAccess {
         }
         match ctx.get_metadata_string(self.0.sessions.session_key()) {
             Some(key) if !self.0.sessions.alive(&key) => Err("you have signed out: sign in again".into()),
+            Some(key) if !self.0.sessions.alive_as(&key, &ctx.user_id) => Err("this session now signs in as someone else: reconnect".into()),
             _ => Ok(()),
         }
     }
@@ -336,6 +337,27 @@ impl LoginAccess for SimpleAccess {
 
     fn session_key(&self) -> Option<&str> {
         Some(self.0.sessions.session_key())
+    }
+
+    fn is_admin(&self, principal: &str) -> bool {
+        principal.parse::<Principal>().is_ok_and(|p| self.0.memberships.held(&p).iter().any(|m| m.role.as_str() == ADMIN))
+    }
+
+    fn held(&self, principal: &str) -> Vec<String> {
+        principal
+            .parse::<Principal>()
+            .map(|p| self.0.memberships.held(&p).into_iter().map(|m| format!("{}@{}", m.role.as_str(), m.scope.as_str())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Roles are global: viewer or editor, on `*`.
+    fn grantable(&self) -> Vec<(SimpleRole, String)> {
+        vec![(SimpleRole::Viewer, "*".into()), (SimpleRole::Editor, "*".into())]
+    }
+
+    /// Whoever waits for an admin.
+    fn known_users(&self) -> Vec<(String, Option<String>)> {
+        self.waiting().into_iter().map(|w| (w.principal, w.name)).collect()
     }
 }
 
