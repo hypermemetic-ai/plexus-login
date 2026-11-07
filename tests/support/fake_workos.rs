@@ -22,7 +22,7 @@
 //! has an active connection but an unverified domain; `nossoconn.example`
 //! is verified with no connection.
 //!
-//! SUPERCONDUCTOR-25: `GET /user_management/users/{id}/identities` answers
+//! SUPERCONDUCTOR-25: `GET /user_management/users/{id}/identities` answers (provider spelled `GithubOAuth`, as real WorkOS spells it)
 //! a `GitHubOAuth` identity for an address in `github_ids` (its numeric id as
 //! `idp_id`), none otherwise; 503 while `identities_unavailable`. The
 //! authorization-code grant also takes a public client's PKCE exchange (a
@@ -556,6 +556,6 @@ async fn identities(State(w): State<FakeWorkOs>, h: HeaderMap, Path(user): Path<
     let Some(email) = st.users.iter().find(|(_, id)| **id == user).map(|(e, _)| e.clone()) else {
         return (StatusCode::NOT_FOUND, Json(json!({ "code": "entity_not_found" }))).into_response();
     };
-    let list: Vec<Value> = st.github_ids.get(&email).map(|id| json!({ "idp_id": id.to_string(), "type": "OAuth", "provider": "GitHubOAuth" })).into_iter().collect();
+    let list: Vec<Value> = st.github_ids.get(&email).map(|id| json!({ "idp_id": id.to_string(), "type": "OAuth", "provider": "GithubOAuth" })).into_iter().collect();
     Json(Value::Array(list)).into_response()
 }

@@ -356,7 +356,7 @@ impl IdentityBackend for WorkOs {
     /// a failure (the caller refuses), never "none linked".
     async fn github_id(&self, subject: &str) -> IdResult<Option<u64>> {
         let ids = self.api.identities(subject).await.map_err(call)?;
-        match ids.iter().find(|i| i.provider == "GitHubOAuth") {
+        match ids.iter().find(|i| i.provider.eq_ignore_ascii_case("GitHubOAuth")) {
             None => Ok(None),
             Some(i) => i.idp_id.trim().parse::<u64>().map(Some).map_err(|_| IdentityError::Unavailable("a GitHub identity whose idp_id is not a number".into())),
         }
