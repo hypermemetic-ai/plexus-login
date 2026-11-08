@@ -8,7 +8,7 @@
 //! | --- | --- |
 //! | [`wiring`] | [`Wiring`] / [`Wired`]: the whole login in two calls — the gate, the anonymous view, the page's router, the auth backend |
 //! | [`admission`] | SUPERCONDUCTOR-25: [`Allow`], who may have a session (`github:<id>`, `principal:<p>`), checked before every browser session and at the socket |
-//! | [`acting`] | test only: an admin acts as any user or makes a test user (`people.*`), gated on [`acting::Environment::Test`] and a non-production host |
+//! | [`acting`] | an admin acts as any user or makes a test user (`people.*`): mounted everywhere, on only for [`acting::Environment::Test`] on a non-production host (refused elsewhere) |
 //! | [`access`] | the seam: [`LoginAccess`], what the app implements; [`Branding`] |
 //! | [`simple`] | [`simple::SimpleAccess`]: ready-made in-memory rules, roles global |
 //! | [`names`] | [`LoginNames`]: the cookies and the session metadata key, the app's |

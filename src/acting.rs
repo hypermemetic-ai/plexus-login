@@ -13,12 +13,15 @@
 //! | `create_user {name, roles}` | an admin, on the sign-in cookie | makes `oidc:test/<name>` with `roles` (granted through the app's [`LoginAccess::dev_grant`]) and becomes it: `became` |
 //! | `unbecome` | the acting session (public) | the session is the admin again: `returned` |
 //!
-//! **Where it exists.** Only where [`enabled`] says so: the app passes its
+//! **Where it is on.** Only where [`enabled`] says so: the app passes its
 //! [`Environment`] and it must be exactly [`Environment::Test`], *and* the
 //! public URL's host must not be one of the app's production hosts (agents:
-//! `agents.menger.sh`; menger: `app.menger.sh`, `menger.sh`). Anywhere else the
-//! activation is not built and the methods do not exist. When it is on, a
-//! `warn` line at startup says so.
+//! `agents.menger.sh`; menger: `app.menger.sh`, `menger.sh`). The activation
+//! is mounted everywhere (so a UI bundle naming `people.*` pushes to any
+//! environment), but anywhere else it is off: `whoami` answers with `can_act:
+//! false`, and `known_users`, `act_as`, `create_user` and `unbecome` are
+//! `refused` with reason [`ACTING_OFF`]. When it is on, a `warn` line at
+//! startup says so.
 //!
 //! **Who.** A caller whose principal holds the app's admin role
 //! ([`LoginAccess::is_admin`]), on a browser session — the `HttpOnly` sign-in
@@ -138,6 +141,11 @@ impl fmt::Display for NotEnabled {
         }
     }
 }
+
+/// The refusal's `reason` everywhere acting is off.
+pub const ACTING_OFF: &str = "acting_off";
+/// The refusal's `message` everywhere acting is off.
+pub const ACTING_OFF_MESSAGE: &str = "Acting as other users is only on in test deployments.";
 
 /// Whether acting may be on: `env` exactly [`Environment::Test`], and
 /// `public_url`'s host none of `prod_hosts` (exact, case-insensitive; a
@@ -300,8 +308,10 @@ pub struct Became {
 }
 
 /// The acting service: the session table, the app's rules, the test users made
-/// here. Made only by [`Acting::enable`].
+/// here. On only when [`Acting::enable`] or [`Acting::new`] found it [`enabled`].
 pub struct Acting {
+    /// Why acting is off; `None`: on.
+    off: Option<NotEnabled>,
     sessions: Arc<Sessions>,
     rules: Arc<dyn Rules>,
     /// Test users made here: principal → (name, roles given).
@@ -331,13 +341,35 @@ impl Acting {
     /// on. Anything else: why not, and nothing is built.
     pub fn enable<A: LoginAccess>(env: Environment, public_url: &str, prod_hosts: &[String], sessions: Arc<Sessions>, access: A) -> Result<Self, NotEnabled> {
         enabled(env, public_url, prod_hosts)?;
-        tracing::warn!(
-            target: "plexus_login::acting",
-            env = %env,
-            public_url,
-            "ACTING IS ON: an admin may act as any user or create test users here (people.act_as, people.create_user) — a test deployment's feature"
-        );
-        Ok(Self { sessions, rules: Arc::new(ViaAccess(access)), created: Mutex::default(), audit: None })
+        Ok(Self::new(env, public_url, prod_hosts, sessions, access))
+    }
+
+    /// Acting over `sessions` and the app's `rules`, always built: on where
+    /// [`enabled`] says so (with the `warn` line), off anywhere else — then
+    /// every method but `whoami` is refused with [`ACTING_OFF`].
+    pub fn new<A: LoginAccess>(env: Environment, public_url: &str, prod_hosts: &[String], sessions: Arc<Sessions>, access: A) -> Self {
+        let off = enabled(env, public_url, prod_hosts).err();
+        if off.is_none() {
+            tracing::warn!(
+                target: "plexus_login::acting",
+                env = %env,
+                public_url,
+                "ACTING IS ON: an admin may act as any user or create test users here (people.act_as, people.create_user) — a test deployment's feature"
+            );
+        }
+        Self { off, sessions, rules: Arc::new(ViaAccess(access)), created: Mutex::default(), audit: None }
+    }
+
+    /// Why acting is off here; `None` when it is on.
+    pub fn off(&self) -> Option<&NotEnabled> {
+        self.off.as_ref()
+    }
+
+    fn on(&self) -> Result<(), Refusal> {
+        match self.off {
+            None => Ok(()),
+            Some(_) => Err(Refusal::new(ACTING_OFF, ACTING_OFF_MESSAGE)),
+        }
     }
 
     /// The same, sending every [`ActingAudit`] to `hook` as well as the log.
@@ -375,7 +407,7 @@ impl Acting {
             signed_in_as: meta_str(ctx, SIGNED_IN_AS),
             signed_in_as_name: meta_str(ctx, SIGNED_IN_AS_NAME),
             admin,
-            can_act: admin && !acting && self.browser_key(ctx).is_some(),
+            can_act: self.off.is_none() && admin && !acting && self.browser_key(ctx).is_some(),
             principal,
         }
     }
@@ -383,6 +415,7 @@ impl Acting {
     /// The caller, when it may act: an admin, on the cookie, not acting. Its
     /// principal and session key.
     fn admin_caller(&self, ctx: &AuthContext) -> Result<(String, String), Refusal> {
+        self.on()?;
         let principal = principal_of(ctx).filter(|_| ctx.is_authenticated()).ok_or_else(|| Refusal::new("signed_out", "sign in first"))?;
         if is_acting(ctx) {
             return Err(Refusal::new("acting", "you are acting as someone else: return to yourself first (people.unbecome)"));
@@ -449,7 +482,7 @@ impl Acting {
                 principal: p,
             })
             .collect();
-        out.sort_by(|a, b| (!a.you, a.admin == false, a.name.clone().unwrap_or_default().to_lowercase()).cmp(&(!b.you, b.admin == false, b.name.clone().unwrap_or_default().to_lowercase())));
+        out.sort_by_key(|u| (!u.you, !u.admin, u.name.clone().unwrap_or_default().to_lowercase()));
         out
     }
 
@@ -540,6 +573,7 @@ impl Acting {
 
     /// `people.unbecome`: the acting session is its admin again.
     pub fn unbecome(&self, ctx: Option<&AuthContext>) -> Result<Became, Refusal> {
+        self.on()?;
         let ctx = ctx.filter(|c| c.is_authenticated()).ok_or_else(|| Refusal::new("signed_out", "sign in first"))?;
         let key = self.browser_key(ctx).ok_or_else(|| Refusal::new("not_a_browser_session", "only the browser session that is acting can return"))?;
         let current = self.sessions.current(&key).ok_or_else(|| Refusal::new("signed_out", "your session has ended: sign in again"))?;
@@ -599,8 +633,9 @@ fn events(v: Vec<PeopleEvent>) -> impl Stream<Item = PeopleEvent> + Send + 'stat
     futures::stream::iter(v)
 }
 
-/// The `people` activation over an [`Acting`]: register it on the hub only
-/// when [`Acting::enable`] made one — anywhere else the methods do not exist.
+/// The `people` activation over an [`Acting`]: register it on every hub. Where
+/// acting is off ([`Acting::off`]) its methods answer, refusing with
+/// [`ACTING_OFF`] (and `whoami` with `can_act: false`).
 #[derive(Clone)]
 pub struct PeopleActivation {
     acting: Arc<Acting>,
@@ -610,12 +645,17 @@ impl PeopleActivation {
     pub fn new(acting: Arc<Acting>) -> Self {
         Self { acting }
     }
+
+    /// Why acting is off here; `None` when it is on.
+    pub fn off(&self) -> Option<&NotEnabled> {
+        self.acting.off()
+    }
 }
 
 #[plexus_rpc::macros::activation(
     namespace = "people",
     version = "0.1.0",
-    description = "Test only: an admin acts as any user, or makes one, and returns",
+    description = "On test deployments only: an admin acts as any user, or makes one",
     auth = "mixed"
 )]
 impl PeopleActivation {
@@ -716,6 +756,28 @@ mod tests {
         let a = SimpleAccess::new(&s, &[]).unwrap();
         assert!(Acting::enable(Environment::Prod, TEST_URL, &prod(), s.clone(), a.clone()).is_err());
         assert!(Acting::enable(Environment::Test, "https://agents.menger.sh", &prod(), s, a).is_err());
+    }
+
+    #[tokio::test]
+    async fn off_it_answers_whoami_and_refuses_the_rest() {
+        let s = Arc::new(Sessions::new(3600, &LoginNames::for_app("toy")));
+        let a = SimpleAccess::new(&s, &[ADA.to_string()]).unwrap();
+        for (env, url) in [(Environment::Prod, TEST_URL), (Environment::Local, "http://127.0.0.1:4470"), (Environment::Test, "https://agents.menger.sh")] {
+            let acting = Acting::new(env, url, &prod(), s.clone(), a.clone());
+            assert!(acting.off().is_some(), "{env} {url}");
+            let (id, _) = s.create(person(ADA, "Ada")).unwrap();
+            let ada = s.get(&id).unwrap();
+            let me = acting.whoami(Some(&ada));
+            assert_eq!(me.principal.as_deref(), Some(ADA));
+            assert!(me.admin && !me.can_act, "{me:?}");
+            let off = |r: Refusal| assert_eq!((r.reason, r.message.as_str()), (ACTING_OFF, ACTING_OFF_MESSAGE));
+            off(acting.known_users(&ada).unwrap_err());
+            off(acting.act_as(&ada, BOB).unwrap_err());
+            off(acting.create_user(&ada, "carol", &[]).await.unwrap_err());
+            off(acting.unbecome(Some(&ada)).unwrap_err());
+        }
+        let on = Acting::new(Environment::Test, TEST_URL, &prod(), s.clone(), a);
+        assert!(on.off().is_none());
     }
 
     #[tokio::test]

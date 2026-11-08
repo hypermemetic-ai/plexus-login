@@ -456,15 +456,16 @@ impl<A: LoginAccess> Wired<A> {
         }
     }
 
-    /// Test only: the `people` activation — an admin acts as any user or
-    /// makes a test user ([`crate::acting`]) — over this login's sessions and
-    /// the app's [`LoginAccess`], when `env` is exactly
-    /// [`crate::acting::Environment::Test`] and the public URL's host is none
-    /// of `prod_hosts`. Register it on the hub; `Err` (why not): don't, and
-    /// the methods do not exist.
-    pub fn acting(&self, env: crate::acting::Environment, prod_hosts: &[String]) -> Result<crate::acting::PeopleActivation, crate::acting::NotEnabled> {
-        let acting = crate::acting::Acting::enable(env, &self.public_url, prod_hosts, self.sessions.clone(), self.access.clone())?;
-        Ok(crate::acting::PeopleActivation::new(Arc::new(acting)))
+    /// The `people` activation — an admin acts as any user or makes a test
+    /// user ([`crate::acting`]) — over this login's sessions and the app's
+    /// [`LoginAccess`]. Always built, to register on every hub: on when `env`
+    /// is exactly [`crate::acting::Environment::Test`] and the public URL's
+    /// host is none of `prod_hosts`; off anywhere else
+    /// ([`crate::acting::PeopleActivation::off`] says why), where its methods
+    /// refuse with [`crate::acting::ACTING_OFF`].
+    pub fn acting(&self, env: crate::acting::Environment, prod_hosts: &[String]) -> crate::acting::PeopleActivation {
+        let acting = crate::acting::Acting::new(env, &self.public_url, prod_hosts, self.sessions.clone(), self.access.clone());
+        crate::acting::PeopleActivation::new(Arc::new(acting))
     }
 
     /// The login page's routes ([`web_login::router`]), when there is a
