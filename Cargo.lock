@@ -1817,6 +1817,8 @@ dependencies = [
 [[package]]
 name = "plexus-auth-core"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2c21d483f48dbc632bfb103998274ed4e75917d0cf3e730998b5c2f903728a1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1841,6 +1843,8 @@ dependencies = [
 [[package]]
 name = "plexus-client"
 version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d92143304212e77f93f962224ccb30800d36daf0198cc639e80997ad5e06a5f9"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -1852,6 +1856,8 @@ dependencies = [
 [[package]]
 name = "plexus-core"
 version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e53b752c21afe5be00981122d5bf65b900a9da715f84407ecd6b89dbf9731b5"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1917,6 +1923,8 @@ dependencies = [
 [[package]]
 name = "plexus-macros"
 version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a700aae001e87b9907cc78b769ca935cc157cc2dfea76aed32ae6084c053dd62"
 dependencies = [
  "heck",
  "proc-macro-crate",
@@ -1930,6 +1938,8 @@ dependencies = [
 [[package]]
 name = "plexus-rpc"
 version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f4ce68a15ed43233c07b3b51afbd9b8502142286aeead71b764da716bb2cd80"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1952,6 +1962,8 @@ dependencies = [
 [[package]]
 name = "plexus-transport"
 version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80b0cd5fc44901bd297433092ad40a21f6c8affa199045b4fd6383f7973aada3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3768,67 +3780,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "plexus-codegen-rust"
-version = "0.1.20260125170504-32e46854"
-
-[[patch.unused]]
-name = "plexus-comms"
-version = "0.1.1"
-
-[[patch.unused]]
-name = "plexus-derive"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "plexus-idp"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "plexus-ir"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "plexus-jsexec"
-version = "0.2.3"
-
-[[patch.unused]]
-name = "plexus-listen"
-version = "0.1.2"
-
-[[patch.unused]]
-name = "plexus-locus"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "plexus-music"
-version = "0.3.0"
-
-[[patch.unused]]
-name = "plexus-registry"
-version = "0.1.5"
-
-[[patch.unused]]
-name = "plexus-substrate"
-version = "0.6.3"
-
-[[patch.unused]]
-name = "plexus-transport-mcp"
-version = "0.4.0"
-
-[[patch.unused]]
-name = "plexus-ui-compiler"
-version = "0.2.1"
-
-[[patch.unused]]
-name = "plexus-ui-engine"
-version = "0.2.1"
-
-[[patch.unused]]
-name = "plexus-ui-service"
-version = "0.2.1"
-
-[[patch.unused]]
-name = "plexus-webapp"
-version = "0.3.1"
