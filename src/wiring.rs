@@ -533,10 +533,14 @@ pub fn shell_origins(shell_port: u16, public_url: &str) -> Vec<String> {
 
 /// KEEL-45: the `Host` names a socket on `ws_port` is reached at — the
 /// authorities of [`login::socket_urls`] (the same list a key proof's
-/// audiences come from): the loopback names for the port and, with a public
-/// URL, its host as a browser names it (`toy.example`, `toy.example:8443`).
+/// audiences come from): the loopback names for the port, `[::1]:<port>`
+/// too (plexus-transport adds it on an IPv6 bind, and a list named here
+/// replaces its default, so it is kept whatever the bind — a literal, which
+/// no page can rebind), and, with a public URL, its host as a browser names
+/// it (`toy.example`, `toy.example:8443`).
 pub fn socket_hosts(ws_port: u16, public_url: Option<&str>) -> Vec<String> {
     let mut hosts = loopback_hosts(ws_port);
+    hosts.push(format!("[::1]:{ws_port}"));
     for u in login::socket_urls(ws_port, public_url) {
         let Ok(u) = url::Url::parse(&u) else { continue };
         let Some(host) = u.host_str() else { continue };
@@ -584,7 +588,7 @@ mod tests {
         assert!(wired.metadata_route().is_some());
         assert_eq!(wired.origins, ["http://127.0.0.1:4591", "http://localhost:4591", "https://toy.example", "https://other.example"]);
         // KEEL-45: behind the public URL the socket answers its name too.
-        assert_eq!(wired.hosts, ["127.0.0.1:4590", "localhost:4590", "toy.example"]);
+        assert_eq!(wired.hosts, ["127.0.0.1:4590", "localhost:4590", "[::1]:4590", "toy.example"]);
     }
 
     /// KEEL-45: the names a socket answers to are its loopback ones and the
@@ -592,13 +596,13 @@ mod tests {
     /// by this crate.
     #[test]
     fn the_socket_answers_its_loopback_names_and_its_public_name() {
-        assert_eq!(socket_hosts(4590, None), ["127.0.0.1:4590", "localhost:4590"]);
-        assert_eq!(socket_hosts(4590, Some("https://Toy.Example:8443/app")), ["127.0.0.1:4590", "localhost:4590", "toy.example:8443"]);
-        assert_eq!(socket_hosts(4590, Some("http://menger.lan:4591/")), ["127.0.0.1:4590", "localhost:4590", "menger.lan:4591"]);
-        assert_eq!(socket_hosts(4590, Some("http://127.0.0.1:4591")), ["127.0.0.1:4590", "localhost:4590", "127.0.0.1:4591"]);
+        assert_eq!(socket_hosts(4590, None), ["127.0.0.1:4590", "localhost:4590", "[::1]:4590"]);
+        assert_eq!(socket_hosts(4590, Some("https://Toy.Example:8443/app")), ["127.0.0.1:4590", "localhost:4590", "[::1]:4590", "toy.example:8443"]);
+        assert_eq!(socket_hosts(4590, Some("http://menger.lan:4591/")), ["127.0.0.1:4590", "localhost:4590", "[::1]:4590", "menger.lan:4591"]);
+        assert_eq!(socket_hosts(4590, Some("http://127.0.0.1:4591")), ["127.0.0.1:4590", "localhost:4590", "[::1]:4590", "127.0.0.1:4591"]);
         let opts = LoginOptions { allowed_hosts: vec!["toy.lan:4590".into()], ..LoginOptions::new(BRAND, 4590, 4591) };
         let wired = Wiring::new(opts).unwrap().finish(TestAccess, None).unwrap();
-        assert_eq!(wired.hosts, ["127.0.0.1:4590", "localhost:4590", "toy.lan:4590"]);
+        assert_eq!(wired.hosts, ["127.0.0.1:4590", "localhost:4590", "[::1]:4590", "toy.lan:4590"]);
     }
 
     #[test]
