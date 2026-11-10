@@ -216,9 +216,9 @@ and `GET /login/callback`.
 
 ```rust
 use std::sync::Arc;
-use plexus_core::plexus::DynamicHub;
+use plexus_rpc::core::plexus::DynamicHub;
 use plexus_login::{Branding, LoginOptions, Wiring, simple::SimpleAccess};
-use plexus_transport::TransportServer;
+use plexus_rpc::transport::TransportServer;
 
 const BRANDING: Branding = Branding { app: "myapp", version: env!("CARGO_PKG_VERSION"), mark: "m", motto: "" };
 
@@ -255,6 +255,7 @@ pub struct LoginOptions {
     pub shell_port: u16,
     pub public_url: Option<String>,      // --public-url (default http://127.0.0.1:<shell_port>)
     pub allowed_origins: Vec<String>,    // --allowed-origin
+    pub allowed_hosts: Vec<String>,      // --allowed-host (KEEL-45): more names the socket answers to
     pub session_ttl_secs: i64,           // default 12 h
     pub sessions_file: Option<PathBuf>,  // FRAME-21: the sessions journal (None: in memory)
     pub require: bool,                   // --require-login
@@ -288,6 +289,8 @@ pub struct Wired<A: LoginAccess> {
     pub gate: Option<Arc<Gate>>,          // the upgrade's validator (login on)
     pub protected: ProtectedResource,     // RFC 9728: the socket and its issuers
     pub origins: Vec<String>,             // the shell's own + --allowed-origin
+    pub hosts: Vec<String>,               // KEEL-45: socket_hosts + --allowed-host (empty: loopback only)
+    pub trusted_proxies: TrustedProxies,  // KEEL-45: the page's and the socket's
     pub public_url: String,
     pub providers: Vec<Provider>,
     pub access: A,
@@ -311,7 +314,18 @@ else.
 
 `apply` always sets the allowed origins. Only the shell's own pages, plus
 any named with `--allowed-origin`, may open the socket from a browser; a
-client such as synapse sends no Origin and is not affected. With login on,
+client such as synapse sends no Origin and is not affected. The socket
+answers only the names it is reached at (plexus-transport 0.10.1, KEEL-29):
+with no public URL its loopback names, which is the transport's default and
+`apply` leaves alone; with a public URL (or `allowed_hosts`) `apply` names
+them — `socket_hosts(ws_port, public_url)`, the loopback names and the
+public URL's host — so a request naming any other `Host` is refused 421.
+Call `apply` after any `with_allowed_hosts` of your own (it replaces the
+list), or put your names in `allowed_hosts`. It never calls
+`allow_any_origin()` or `allow_any_host()`. When `trusted_proxies` says
+anything, `apply` hands the same set to the transport, so the socket's
+quotas and its own-origin check read the edge's `X-Forwarded-*` as the page
+does. With login on,
 `apply` also sets the gate, the anonymous view, `access_token` as the one
 credential cookie and the protected resource. With no provider, login is
 off: there is no gate and no page, and nothing is refused.
@@ -319,6 +333,13 @@ off: there is no gate and no page, and nothing is refused.
 A shell that mounts the routes itself (menger's `shell.rs`) takes
 `wired.login`. For `--require-login` redirects it uses `Login::session`
 (who a request's cookie is), and for Host checks it uses `Login::hosts`.
+
+**Who a browser is** (KEEL-45): `Sessions::session_of(&HeaderMap)` is the
+session a request's cookie names, while it lasts; `Sessions::principal_of`
+its principal; `Sessions::id_of` the cookie's session id. A route of another
+crate that needs "which principal is this browser signed in as" (the
+bridge's callback, for one) takes
+`move |h: &HeaderMap| sessions.principal_of(h).map(|p| p.to_string())`.
 
 ## Sessions that survive a restart (FRAME-21)
 
@@ -500,6 +521,11 @@ other container on that network could otherwise forge `X-Forwarded-For`.
 An `X-Forwarded-For` from a peer that is not trusted is logged once, as an
 error.
 
+The trusted proxies and the walk over `X-Forwarded-For` are
+plexus-transport's (`plexus_login::client_ip::TrustedProxies` is
+`plexus_rpc::transport::TrustedProxies`, KEEL-45): one `--trusted-proxy`
+set, parsed once, serves the page and the socket.
+
 Serve the router with the peer's address, so the throttles see who asks:
 `axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())`
 (plexus-webapp's `serve_on` does). Without it every unknown client shares one
@@ -524,7 +550,11 @@ out with a strict CSP.
 ## Build and test
 
 A repository and cargo workspace of its own. A checkout builds alone,
-against the plexus 0.8 line from crates.io.
+against the plexus 0.11 line from crates.io through the `plexus-rpc` 0.11
+umbrella, with the security releases as its floor: plexus-core 0.11.1,
+plexus-transport 0.10.1, plexus-auth-core 0.3.2, plexus-macros 0.11.1
+(KEEL-45). Moving from 0.4 (the 0.10 line) or 0.3 (the 0.8 line):
+CHANGELOG.md.
 
 ```sh
 cargo test --workspace                     # the unit tests and tests/ (the sign-in flows, the toy)

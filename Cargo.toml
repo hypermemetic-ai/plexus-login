@@ -20,7 +20,7 @@ categories = ["authentication", "web-programming::http-server"]
 # What the package carries: the sources and the page (src/web_login.rs
 # include_str!s web/login.html). The tests and the example stay in the
 # repository.
-include = ["/src/**", "/web/login.html", "/README.md", "/LICENSE"]
+include = ["/src/**", "/web/login.html", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
 [dependencies]
 # The plexus 0.11 line (KEEL-45; 0.10 before it, NEST-13; 0.8, PLEXUS-16, V2-58), through the
