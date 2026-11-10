@@ -107,6 +107,7 @@ async fn issuer() -> String {
 
 struct Toy {
     ws: u16,
+    shell: u16,
     public_url: String,
     cookie: String,
     access: SimpleAccess,
@@ -114,12 +115,18 @@ struct Toy {
 }
 
 async fn toy() -> Toy {
+    toy_at(None).await
+}
+
+/// The toy, its shell reached at `public` when given (behind a proxy).
+async fn toy_at(public: Option<&str>) -> Toy {
     let iss = issuer().await;
     let (ws, shell) = (free_port().await, free_port().await);
     let admin = format!("idp:{ADMIN_SUB}");
 
     // ── what README.md shows: login in a dozen lines ──
     let opts = LoginOptions::new(BRANDING, ws, shell).with_providers([format!("idp={iss},plexus:toy")]).unwrap();
+    let opts = LoginOptions { public_url: public.map(str::to_string), ..opts };
     let wiring = Wiring::new(opts).unwrap();
     let access = SimpleAccess::new(wiring.sessions(), &[admin]).unwrap();
     let wired = wiring.finish(access.clone(), None).unwrap();
@@ -144,6 +151,7 @@ async fn toy() -> Toy {
     }
     Toy {
         ws,
+        shell,
         public_url: wired.public_url.clone(),
         cookie: wired.sessions.cookie_name().to_string(),
         access,
@@ -246,4 +254,77 @@ async fn a_service_that_is_not_menger_signs_a_person_in_through_plexus_login() {
     assert_eq!(out.status(), 303);
     let me = toy.http.get(format!("{}/login/me", toy.public_url)).header("cookie", &cookie).send().await.unwrap();
     assert_eq!(me.status(), 401);
+}
+
+/// The status line of a WebSocket upgrade to `port` naming `host` and, when
+/// given, `origin` — as a browser page would send it.
+async fn upgrade(port: u16, host: &str, origin: Option<&str>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("the socket accepts");
+    let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
+    let req = format!(
+        "GET / HTTP/1.1\r\nHost: {host}\r\n{origin}Connection: Upgrade\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 512];
+    let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.expect("an answer").unwrap();
+    String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or_default().to_string()
+}
+
+/// KEEL-45: `Wired::apply` takes plexus-transport 0.10.1's front door as it
+/// is (KEEL-29) — the shell's own pages open the socket and no other page
+/// does (403); the socket answers its loopback names and no rebound one
+/// (421); a client with no `Origin` is admitted (into the anonymous view).
+#[tokio::test]
+async fn the_socket_admits_the_shells_pages_and_refuses_any_other() {
+    let toy = toy().await;
+    let own = format!("127.0.0.1:{}", toy.ws);
+    for origin in [format!("http://127.0.0.1:{}", toy.shell), format!("http://localhost:{}", toy.shell)] {
+        let line = upgrade(toy.ws, &own, Some(&origin)).await;
+        assert!(line.contains(" 101 "), "the shell's page ({origin}): {line}");
+    }
+    assert!(upgrade(toy.ws, &own, None).await.contains(" 101 "), "no Origin: a native client");
+    for origin in ["http://evil.example", "null", &format!("http://127.0.0.1:{}", toy.ws)] {
+        let line = upgrade(toy.ws, &own, Some(origin)).await;
+        assert!(line.contains(" 403 "), "a page from {origin}: {line}");
+    }
+    let line = upgrade(toy.ws, &format!("evil.example:{}", toy.ws), None).await;
+    assert!(line.contains(" 421 "), "a rebound name: {line}");
+}
+
+/// KEEL-45: behind a public URL the socket answers that name too — what
+/// `Wired::apply` names (`Wired::hosts`), since plexus-transport answers
+/// only the loopback names by default — and still no other.
+#[tokio::test]
+async fn behind_a_public_url_the_socket_answers_its_public_name() {
+    let toy = toy_at(Some("https://toy.example")).await;
+    let line = upgrade(toy.ws, "toy.example", Some("https://toy.example")).await;
+    assert!(line.contains(" 101 "), "the public page through the proxy: {line}");
+    let line = upgrade(toy.ws, &format!("127.0.0.1:{}", toy.ws), None).await;
+    assert!(line.contains(" 101 "), "the loopback name: {line}");
+    let line = upgrade(toy.ws, "evil.example", Some("https://toy.example")).await;
+    assert!(line.contains(" 421 "), "another name: {line}");
+    let line = upgrade(toy.ws, "toy.example", Some("https://evil.example")).await;
+    assert!(line.contains(" 403 "), "another page: {line}");
+}
+
+/// KEEL-45: a method that acts on the whole service (`auth.waiting`, marked
+/// `everywhere` in plexus-core 0.11.1, KEEL-31) is refused by the gate to an
+/// admin on a narrower scope, and answered for the admin on `*`.
+#[tokio::test]
+async fn a_scoped_admin_is_refused_what_acts_on_the_whole_service() {
+    let toy = toy().await;
+    let root = toy.sign_in("root", "s3cret").await.expect("the admin signs in");
+    let admin = toy.socket(Some(&root)).await;
+    let granted = call(&admin, "auth.grant", json!({ "principal": format!("idp:{ALICE_SUB}"), "role": "admin", "scope": "TOY" })).await;
+    assert!(!granted.to_string().contains("\"error\""), "{granted}");
+
+    let cookie = toy.sign_in("alice", "s3cret").await.expect("signed in");
+    let alice = toy.socket(Some(&cookie)).await;
+    let waiting = call(&alice, "auth.waiting", json!({})).await;
+    assert_eq!(waiting[0]["error_kind"], "forbidden", "{waiting}");
+    assert!(waiting.to_string().contains("\"*\""), "refused on `*`: {waiting}");
+    let waiting = call(&admin, "auth.waiting", json!({})).await;
+    assert!(!waiting.to_string().contains("\"error\""), "the admin on `*`: {waiting}");
 }

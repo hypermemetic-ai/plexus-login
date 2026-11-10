@@ -237,8 +237,7 @@ impl Continuation for AppContinuation {
     }
 
     fn account(&self, headers: &HeaderMap) -> Option<AccountHolder> {
-        let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
-        let ctx = self.sessions.get(sessions::cookie(cookies, self.sessions.cookie_name())?)?;
+        let ctx = self.sessions.session_of(headers)?;
         let int = |k: &str| ctx.metadata.get(k).and_then(Value::as_i64);
         Some(AccountHolder {
             subject: ctx.get_metadata_string("subject")?,

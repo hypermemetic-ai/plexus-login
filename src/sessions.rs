@@ -49,6 +49,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use base64::Engine as _;
 use plexus_rpc::auth_core::adapters::Carriers;
+use plexus_rpc::auth_core::identity::Principal;
 use plexus_rpc::core::plexus::{AuthContext, SessionValidator};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -98,12 +99,21 @@ pub fn not_kept(e: io::Error) -> axum::response::Response {
     (axum::http::StatusCode::SERVICE_UNAVAILABLE, [(axum::http::header::RETRY_AFTER, "5")], "Signing in is unavailable for a moment: your session could not be kept. Try again.").into_response()
 }
 
-/// A named cookie's value in a `Cookie` header.
+/// A named cookie's value in a `Cookie` header. KEEL-45 (review F2): the
+/// name more than once is nobody — a cookie another origin on this host
+/// planted would otherwise shadow ours by coming first.
 pub fn cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
-    header.split(';').find_map(|pair| {
-        let (n, v) = pair.trim().split_once('=')?;
-        (n == name && !v.is_empty()).then_some(v.trim())
-    })
+    let mut found = None;
+    for pair in header.split(';') {
+        let Some((n, v)) = pair.trim().split_once('=') else { continue };
+        if n == name {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(v.trim());
+        }
+    }
+    found.filter(|v| !v.is_empty())
 }
 
 #[derive(Clone)]
@@ -630,6 +640,61 @@ impl Sessions {
         self.used(&hash(id))
     }
 
+    /// KEEL-45 (the consolidation review's row 14): the session id a
+    /// request's cookies name under this table's cookie — the one place a
+    /// request's session cookie is read. Every `Cookie` field is read (HTTP/2
+    /// sends one per cookie); the name more than once, in one field or
+    /// across them, is nobody (a cookie planted by another origin on this
+    /// host shadows ours, and which one a browser sends first is not ours to
+    /// pick).
+    pub fn id_of<'a>(&self, headers: &'a axum::http::HeaderMap) -> Option<&'a str> {
+        let name = self.cookie_name();
+        let mut found = None;
+        for field in headers.get_all(axum::http::header::COOKIE) {
+            let Ok(field) = field.to_str() else { continue };
+            for pair in field.split(';') {
+                let Some((n, v)) = pair.trim().split_once('=') else { continue };
+                if n != name {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(v.trim());
+            }
+        }
+        found.filter(|v| !v.is_empty())
+    }
+
+    /// KEEL-45: the browser session of this request; never an agent's. The
+    /// session its cookie names, while it lasts (used now, as
+    /// [`Sessions::get`]), only when it is a browser's
+    /// ([`Sessions::create`]): a minted agent token ([`Sessions::mint`])
+    /// sent as the cookie is nobody, and so is a session whose identity
+    /// carries a ceiling — never answered as if it had none.
+    pub fn session_of(&self, headers: &axum::http::HeaderMap) -> Option<AuthContext> {
+        let key = hash(self.id_of(headers)?);
+        if !self.live.lock().unwrap().get_mut(&key).is_some_and(|s| s.idles) {
+            return None;
+        }
+        let ctx = self.used(&key)?;
+        if ctx.metadata.get(plexus_rpc::core::plexus::CEILING_KEY).is_some() {
+            return None;
+        }
+        Some(ctx)
+    }
+
+    /// KEEL-45: the browser session of this request; never an agent's. The
+    /// principal the browser sending `headers` is signed in as (its
+    /// [`Sessions::session_of`]'s, as the gate writes it); `None` when it is
+    /// not signed in, sends an agent's token, or its session names none.
+    /// The session reader a route of another crate takes —
+    /// plexus-integrations' bridge, for one, as
+    /// `move |h: &HeaderMap| sessions.principal_of(h).map(|p| p.to_string())`.
+    pub fn principal_of(&self, headers: &axum::http::HeaderMap) -> Option<Principal> {
+        self.session_of(headers)?.principal()
+    }
+
     /// Ends a session (sign-out). Its sockets stop answering on their next
     /// call ([`Sessions::alive`]).
     pub fn end(&self, id: &str) {
@@ -822,6 +887,43 @@ mod tests {
         s.end(&id);
         assert!(s.get(&id).is_none());
         assert!(!s.alive(&key), "its sockets see it gone");
+    }
+
+    /// KEEL-45: a request's session is read in one place — the cookie under
+    /// this table's name, another cookie or none is nobody, an ended
+    /// session is nobody, and the principal is the session's stamp.
+    #[test]
+    fn a_requests_session_and_principal_are_read_from_its_cookie() {
+        use axum::http::{header, HeaderMap, HeaderValue};
+        let s = Sessions::new(3600, &names());
+        let who = AuthContext::new("u".into(), "sid".into(), vec![], json!({ "principal": "idp:c952acd3-60aa-4534-b2e3-83634591fee1" }));
+        let (id, _) = s.create(who).unwrap();
+        let (nameless, _) = s.create(alice()).unwrap();
+        let with = |cookie: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::COOKIE, HeaderValue::from_str(cookie).unwrap());
+            h
+        };
+        let name = s.cookie_name().to_string();
+        let h = with(&format!("other=x; {name}={id}"));
+        assert_eq!(s.id_of(&h), Some(id.as_str()));
+        assert_eq!(s.session_of(&h).map(|c| c.user_id), Some("u".to_string()));
+        assert_eq!(s.principal_of(&h).map(|p| p.to_string()).as_deref(), Some("idp:c952acd3-60aa-4534-b2e3-83634591fee1"));
+        assert!(s.principal_of(&with(&format!("{name}={nameless}"))).is_none(), "a session that names no principal");
+        assert!(s.principal_of(&with(&format!("{name}x={id}"))).is_none() && s.principal_of(&HeaderMap::new()).is_none());
+        s.end(&id);
+        assert!(s.session_of(&h).is_none() && s.principal_of(&h).is_none(), "signed out");
+    }
+
+    /// KEEL-45 (review F2): every reader of a cookie — the gate's, the
+    /// login transaction's, the dev sign-in's — takes a name sent twice as
+    /// nobody.
+    #[test]
+    fn a_cookie_named_twice_is_nobody() {
+        assert_eq!(cookie("a=1; s=x; b=2", "s"), Some("x"));
+        assert_eq!(cookie("s=evil; s=x", "s"), None);
+        assert_eq!(cookie("s=; t=1", "s"), None);
+        assert_eq!(cookie("ss=1; s2=2", "s"), None);
     }
 
     #[test]

@@ -212,7 +212,10 @@ async fn an_untrusted_forwarded_header_is_not_believed() {
         statuses.push(b.post("/login/email", &[("csrf", &csrf), ("email", &format!("x{i}@example.test"))]).await.status);
     }
     assert_eq!(statuses, [200, 200, 429]);
-    assert!(log_text().contains("X-Forwarded-For arrives from a peer that is not a trusted proxy"));
+    // KEEL-45: the warning is plexus-transport's (one proxy walk), in its
+    // words: "X-Forwarded-For/-Proto arrives from a peer that is not a
+    // trusted proxy and is ignored: …".
+    assert!(log_text().contains("arrives from a peer that is not a trusted proxy"), "{}", log_text());
 }
 
 #[tokio::test]
@@ -436,7 +439,10 @@ async fn none_still_warns_when_a_forwarded_header_arrives() {
     b.get("/login").await;
     let csrf = b.csrf().await;
     b.post("/login/email", &[("csrf", &csrf), ("email", "n@example.test")]).await;
-    assert!(log_text().contains("X-Forwarded-For arrives from a peer that is not a trusted proxy"));
+    // KEEL-45: the warning is plexus-transport's (one proxy walk), in its
+    // words: "X-Forwarded-For/-Proto arrives from a peer that is not a
+    // trusted proxy and is ignored: …".
+    assert!(log_text().contains("arrives from a peer that is not a trusted proxy"), "{}", log_text());
 }
 
 // ── AUTH-26 ────────────────────────────────────────────────────────────

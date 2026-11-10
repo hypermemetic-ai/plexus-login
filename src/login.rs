@@ -353,7 +353,7 @@ pub fn boundary(providers: &[Provider]) -> anyhow::Result<Option<Arc<Carriers>>>
 /// and (menger's ACCESS-30) that form at `/ws` — behind a proxy that
 /// terminates TLS, the socket is the public origin's `/ws`.
 pub fn socket_urls(port: u16, public_url: Option<&str>) -> Vec<String> {
-    let mut out = vec![format!("ws://127.0.0.1:{port}"), format!("ws://localhost:{port}")];
+    let mut out: Vec<String> = plexus_rpc::transport::host::loopback_hosts(port).into_iter().map(|h| format!("ws://{h}")).collect();
     if let Some(mut u) = public_url.and_then(|p| url::Url::parse(p).ok()) {
         let scheme = match u.scheme() {
             "http" | "ws" => Some("ws"),

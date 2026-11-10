@@ -2,7 +2,7 @@
 
 [package]
 name = "plexus-login"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 description = "Login for a Plexus RPC service — our own sign-in page over a swappable identity backend (WorkOS, plexus-idp, memory), provider specs (OIDC, WorkOS, Auth0, plexus-idp, nostr, agent keys), the login page and its routes, sessions, the WebSocket gate and the auth backend — generic over the app's access rules"
@@ -20,15 +20,23 @@ categories = ["authentication", "web-programming::http-server"]
 # What the package carries: the sources and the page (src/web_login.rs
 # include_str!s web/login.html). The tests and the example stay in the
 # repository.
-include = ["/src/**", "/web/login.html", "/README.md", "/LICENSE"]
+include = ["/src/**", "/web/login.html", "/README.md", "/CHANGELOG.md", "/LICENSE"]
 
 [dependencies]
-# The plexus 0.10 line (NEST-13; 0.8 before it, PLEXUS-16, V2-58), through the
+# The plexus 0.11 line (KEEL-45; 0.10 before it, NEST-13; 0.8, PLEXUS-16, V2-58), through the
 # umbrella (PLEXUS-44): plexus-core, plexus-auth-core with its identity
 # adapters, and plexus-transport — SCAFFOLD-9: `Wired::apply` puts the gate,
 # the anonymous view and the protected resource on a TransportServerBuilder.
 # Slim: no MCP, no REST.
-plexus-rpc = { version = "0.10.0", features = ["auth-adapters"] }
+plexus-rpc = { version = "0.11.0", features = ["auth-adapters"] }
+# KEEL-45: the floor of the fixed line. plexus-rpc 0.11.0 asks only ^0.11.0 /
+# ^0.10 / ^0.3.1, which a lockfile may hold below the security releases of
+# 2026-11-10 (KEEL-19, KEEL-29, KEEL-31..33); these lines require them. The
+# code names them through the umbrella.
+plexus-core = { version = "0.11.1", default-features = false }
+plexus-transport = { version = "0.10.1", default-features = false }
+plexus-auth-core = "0.3.2"
+plexus-macros = "0.11.1"
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 url = "2"
@@ -43,8 +51,8 @@ serde_json = "1"
 futures = "0.3"
 anyhow = "1"
 tracing = "0.1"
-# AUTH-22: trusted proxies' CIDRs; TOTP's HMAC-SHA1 (RFC 6238).
-ipnet = "2"
+# AUTH-22: TOTP's HMAC-SHA1 (RFC 6238). (The trusted proxies' CIDRs are
+# plexus-transport's since KEEL-45.)
 sha1 = "0.10"
 tokio = { version = "1", features = ["rt", "time", "macros"] }
 
