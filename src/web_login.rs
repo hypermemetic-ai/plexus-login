@@ -312,10 +312,10 @@ impl<A: LoginAccess> Login<A> {
             .collect()
     }
 
-    /// The session a request's cookie names, while it lasts.
+    /// The session a request's cookie names, while it lasts
+    /// ([`Sessions::session_of`]).
     pub fn session(&self, headers: &HeaderMap) -> Option<AuthContext> {
-        let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
-        self.sessions.get(sessions::cookie(cookies, self.sessions.cookie_name())?)
+        self.sessions.session_of(headers)
     }
 
     /// A POST from a page not ours is refused (login CSRF, logout CSRF):
@@ -1178,7 +1178,7 @@ pub async fn logout<A: LoginAccess>(State(login): State<Arc<Login<A>>>, headers:
         p.sign_out_url(&ctx.session_id, &format!("{}/login", login.public_url))
     });
     let name = login.sessions.cookie_name();
-    if let Some(id) = headers.get(header::COOKIE).and_then(|c| c.to_str().ok()).and_then(|c| sessions::cookie(c, name)) {
+    if let Some(id) = login.sessions.id_of(&headers) {
         login.sessions.end(id);
     }
     let mut r = match onward {
