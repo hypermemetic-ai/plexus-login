@@ -24,8 +24,10 @@ passed on 0.11 before anything below.
   only the names it is reached at (421 otherwise). With no public URL those
   are its loopback names — the transport's default, left alone. With a
   `public_url` (or `allowed_hosts`) `apply` now names them:
-  `socket_hosts(ws_port, public_url)` — the loopback names and the public
-  URL's host as a browser sends it — plus `allowed_hosts`. Without that, a
+  `socket_hosts(ws_port, public_url)` — the loopback names (`[::1]:<port>`
+  among them, which the transport adds only on an IPv6 bind and a named
+  list would otherwise lose) and the public URL's host as a browser sends
+  it — plus `allowed_hosts`. Without that, a
   socket behind a public URL would refuse every page that reached it
   through its proxy. `apply` calls `with_allowed_hosts`, which **replaces**
   a list set before it. Nothing here calls `allow_any_origin()` or
@@ -64,12 +66,32 @@ passed on 0.11 before anything below.
   `Login::session`, sign-out and the account page read through them. A
   route of another crate that asks which principal a browser is signed in
   as (plexus-integrations' bridge) takes
-  `move |h| sessions.principal_of(h).map(|p| p.to_string())`.
+  `move |h| sessions.principal_of(h).map(|p| p.to_string())`. They answer
+  **the browser session of this request, never an agent's** (the review's
+  F1): browser sessions (`Sessions::create`) and agent tokens
+  (`Sessions::mint`, `mgs_…`) share one table, and a session is answered
+  only when it is a browser's, by its kind; one whose identity carries a
+  ceiling (`CEILING_KEY`) is nobody, never answered as if it had none.
+- **A cookie named twice is nobody** (F2): `sessions::cookie`, and so the
+  socket's gate, the login transaction and the dev sign-in, answer `None`
+  when the name appears more than once (another origin on the same host,
+  over plain http, can plant a shadowing cookie that the browser sends
+  first); `Sessions::id_of` reads every `Cookie` field (HTTP/2 sends one per
+  cookie), the name once across all of them.
+- Behaviour that moves with F1: the page (`Login::session`, so a shell's
+  `--require-login` redirect; the account page; sign-out's provider
+  sign-out) no longer takes an agent's minted token sent as the session
+  cookie as a signed-in browser. No existing test relied on it. The socket's
+  gate still takes a minted token, as a cookie or a bearer, with its
+  ceiling.
 - Tests changed: `review`'s `an_untrusted_forwarded_header_is_not_believed`
   and `none_still_warns_when_a_forwarded_header_arrives` assert the shared
   part of the warning's words, since the warning is now the transport's;
   what they hold is unchanged.
-- Tests: `simple_login`'s `the_socket_admits_the_shells_pages_and_refuses_any_other`,
+- Tests: `session_reader` (the review's attack cases, kept: a minted agent
+  token, narrowed or not, is no browser; a ceiled browser session is
+  nobody; a cookie named twice is nobody, every field is read);
+  `sessions::tests::a_cookie_named_twice_is_nobody`; `simple_login`'s `the_socket_admits_the_shells_pages_and_refuses_any_other`,
   `behind_a_public_url_the_socket_answers_its_public_name`,
   `a_scoped_admin_is_refused_what_acts_on_the_whole_service` (an admin on
   scope `TOY` is refused `auth.waiting` by the gate, `forbidden` on `*`;
@@ -101,10 +123,16 @@ In this order:
    (`auth.role_set`, `auth.waiting`, `config.*.set|reset|confirm`) are
    marked already: an admin on a narrower scope is refused them by the gate
    now, `forbidden` with scope `*`, before the method runs.
-4. **Names and proxies.** If you call `with_allowed_hosts` yourself, put
-   those names in `LoginOptions::allowed_hosts` (or call yours after
-   `apply`, including `wired.hosts`): `apply` replaces the list when there
-   is a public URL. Parse `--trusted-proxy` once, into
+4. **Names and proxies.** `Wired::apply` **replaces** a host list set
+   earlier on the builder (`with_allowed_hosts`) whenever there is a public
+   URL or `allowed_hosts` — it only ever narrows, never opens, so the cost
+   is availability: a name in the earlier list and not in `wired.hosts`
+   is refused 421. (`wired.hosts` keeps `[::1]:<port>`, which a list of
+   your own named before `apply` might have lost on an IPv6 loopback bind.)
+   So put your names in `LoginOptions::allowed_hosts`, or call your
+   `with_allowed_hosts` after `apply` with `wired.hosts` included. menger
+   today calls `with_allowed_hosts(hosts(ws_port))` before `apply`: move
+   that list into `allowed_hosts`. Parse `--trusted-proxy` once, into
    `LoginOptions::trusted_proxies`; `apply` gives the transport the same
    set, so a separate `with_trusted_proxies` is no longer needed.
    `--allowed-origin` / `--allowed-host` `*` refuses the start (no
