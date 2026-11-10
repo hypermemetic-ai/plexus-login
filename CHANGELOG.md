@@ -43,7 +43,10 @@ passed on 0.11 before anything below.
   a peer that may be unknown, is the free function
   `client_ip::client_ip(&proxies, Option<IpAddr>, &headers)`. A mixed
   `none` spec is refused in the transport's words (`trusted proxy `none`
-  stands alone: …`).
+  stands alone: …`), and a forwarded header from an untrusted peer is
+  warned of (once, at error, as before) in the transport's: `X-Forwarded-For/-Proto
+  arrives from a peer that is not a trusted proxy and is ignored: …`. A log
+  filter on the old words moves with it.
 - `shell_origins` and `login::socket_urls` build their loopback part from
   plexus-transport's `host::loopback_hosts` (row 9, the part local to this
   crate). Same values.
@@ -62,6 +65,10 @@ passed on 0.11 before anything below.
   route of another crate that asks which principal a browser is signed in
   as (plexus-integrations' bridge) takes
   `move |h| sessions.principal_of(h).map(|p| p.to_string())`.
+- Tests changed: `review`'s `an_untrusted_forwarded_header_is_not_believed`
+  and `none_still_warns_when_a_forwarded_header_arrives` assert the shared
+  part of the warning's words, since the warning is now the transport's;
+  what they hold is unchanged.
 - Tests: `simple_login`'s `the_socket_admits_the_shells_pages_and_refuses_any_other`,
   `behind_a_public_url_the_socket_answers_its_public_name`,
   `a_scoped_admin_is_refused_what_acts_on_the_whole_service` (an admin on
