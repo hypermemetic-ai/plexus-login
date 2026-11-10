@@ -1816,9 +1816,9 @@ dependencies = [
 
 [[package]]
 name = "plexus-auth-core"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2c21d483f48dbc632bfb103998274ed4e75917d0cf3e730998b5c2f903728a1"
+checksum = "b5d8c4a1efa2d09caf769a0257f8aae23d8a1c3beaa699afcee60f1b1a659e11"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1842,9 +1842,9 @@ dependencies = [
 
 [[package]]
 name = "plexus-client"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d92143304212e77f93f962224ccb30800d36daf0198cc639e80997ad5e06a5f9"
+checksum = "150a94986ca3647817fada7eae0b269313228798968f56af891bdb47404188d1"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -1855,9 +1855,9 @@ dependencies = [
 
 [[package]]
 name = "plexus-core"
-version = "0.10.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e53b752c21afe5be00981122d5bf65b900a9da715f84407ecd6b89dbf9731b5"
+checksum = "9fb2c503395d2d2468c48daf02a040ca41df9cb629fa198584eb1f26ab1e8dcb"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1875,6 +1875,7 @@ dependencies = [
  "getrandom 0.3.4",
  "http",
  "jsonrpsee",
+ "libc",
  "pin-project-lite",
  "plexus-auth-core",
  "plexus-client",
@@ -1896,7 +1897,7 @@ dependencies = [
 
 [[package]]
 name = "plexus-login"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1906,7 +1907,11 @@ dependencies = [
  "ipnet",
  "jsonrpsee",
  "jsonwebtoken 9.3.1",
+ "plexus-auth-core",
+ "plexus-core",
+ "plexus-macros",
  "plexus-rpc",
+ "plexus-transport",
  "rand 0.8.8",
  "reqwest",
  "serde",
@@ -1922,9 +1927,9 @@ dependencies = [
 
 [[package]]
 name = "plexus-macros"
-version = "0.10.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a700aae001e87b9907cc78b769ca935cc157cc2dfea76aed32ae6084c053dd62"
+checksum = "5d20f25766bab41ac036eea186f732fcbbb3685eca7a42d4f48bc37e74ebfffe"
 dependencies = [
  "heck",
  "proc-macro-crate",
@@ -1937,9 +1942,9 @@ dependencies = [
 
 [[package]]
 name = "plexus-rpc"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f4ce68a15ed43233c07b3b51afbd9b8502142286aeead71b764da716bb2cd80"
+checksum = "8b76e0413baca64ffaadc687ccf48646e23fb64df82c37ffcef84f2da4d7e62f"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1961,9 +1966,9 @@ dependencies = [
 
 [[package]]
 name = "plexus-transport"
-version = "0.9.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80b0cd5fc44901bd297433092ad40a21f6c8affa199045b4fd6383f7973aada3"
+checksum = "4db9e2e3925be38baa51213bef8d2a955e55a74c917aa4b9ada2e296cd8305f0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1987,6 +1992,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "tracing",
+ "tracing-core",
 ]
 
 [[package]]
