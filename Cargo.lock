@@ -1904,7 +1904,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures",
- "ipnet",
  "jsonrpsee",
  "jsonwebtoken 9.3.1",
  "plexus-auth-core",

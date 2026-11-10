@@ -54,7 +54,7 @@ use sha2::{Digest, Sha256};
 
 use crate::access::{Branding, LoginAccess};
 use crate::app_session::{AppContinuation, TokenStore};
-use crate::client_ip::{peer_ip, Peer, TrustedProxies};
+use crate::client_ip::{client_ip, peer_ip, Peer, TrustedProxies};
 use crate::dev_login::{self, DevLogin};
 use crate::identity::IdentityBackend;
 use crate::login::{LoginButton, Provider};
@@ -282,7 +282,7 @@ impl<A: LoginAccess> Login<A> {
     /// ACCESS-29: the client a request comes from (the peer, or behind a
     /// trusted proxy the hop it names).
     fn client(&self, peer: &Peer, headers: &HeaderMap) -> Option<std::net::IpAddr> {
-        self.trusted.client_ip(peer_ip(peer), headers)
+        client_ip(&self.trusted, peer_ip(peer), headers)
     }
 
     /// ACCESS-29: a flow for this client, or the page that says to wait.

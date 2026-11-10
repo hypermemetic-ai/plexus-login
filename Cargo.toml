@@ -51,8 +51,8 @@ serde_json = "1"
 futures = "0.3"
 anyhow = "1"
 tracing = "0.1"
-# AUTH-22: trusted proxies' CIDRs; TOTP's HMAC-SHA1 (RFC 6238).
-ipnet = "2"
+# AUTH-22: TOTP's HMAC-SHA1 (RFC 6238). (The trusted proxies' CIDRs are
+# plexus-transport's since KEEL-45.)
 sha1 = "0.10"
 tokio = { version = "1", features = ["rt", "time", "macros"] }
 

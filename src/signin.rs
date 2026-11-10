@@ -58,7 +58,7 @@ use base64::Engine as _;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::client_ip::{peer_ip, Peer, TrustedProxies};
+use crate::client_ip::{client_ip, peer_ip, Peer, TrustedProxies};
 use crate::crypto::{constant_eq, hmac_sha256};
 use crate::identity::{Choice, Federated, IdentityBackend, IdentityError, Method, RequestInfo, SignedIn, Social, Ticket, TotpEnrolment};
 use crate::page::{self, esc, heading, Body};
@@ -402,7 +402,7 @@ impl SignInPage {
         if peer.is_none() {
             crate::client_ip::warn_no_peer();
         }
-        let ip = self.cfg.trusted_proxies.client_ip(peer_ip(peer), headers);
+        let ip = client_ip(&self.cfg.trusted_proxies, peer_ip(peer), headers);
         let user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|v| v.chars().take(512).collect());
         let foreign = headers
             .get(header::ORIGIN)
