@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use plexus_rpc::auth_core::adapters::Carriers;
 use plexus_rpc::core::plexus::Activation;
+use plexus_rpc::transport::host::loopback_hosts;
 use plexus_rpc::transport::{ProtectedResource, TransportServerBuilder};
 
 use crate::access::{Branding, LoginAccess};
@@ -69,6 +70,10 @@ pub struct LoginOptions {
     /// `--allowed-origin`s: more origins whose pages may open the socket
     /// (the shell's own always may).
     pub allowed_origins: Vec<String>,
+    /// KEEL-45: `--allowed-host`s: more `Host` names the socket answers to,
+    /// beyond the ones [`socket_hosts`] gives (its loopback names and the
+    /// public URL's). Never `*`: plexus-transport refuses the start.
+    pub allowed_hosts: Vec<String>,
     /// How long a sign-in lasts (default 12 h).
     pub session_ttl_secs: i64,
     /// ACCESS-29: how long a browser's sign-in may go unused before it ends
@@ -155,6 +160,7 @@ impl LoginOptions {
             shell_port,
             public_url: None,
             allowed_origins: Vec::new(),
+            allowed_hosts: Vec::new(),
             session_ttl_secs: 12 * 3600,
             session_idle_secs: crate::sessions::IDLE_SECS_DEFAULT,
             sessions_file: None,
@@ -341,7 +347,33 @@ impl Wiring {
         // the socket from a browser; a client sends no Origin.
         let mut origins = shell_origins;
         origins.extend(opts.allowed_origins.iter().cloned());
-        Ok(Wired { sessions, login, backend, gate, protected, origins, public_url, providers: opts.providers, access, identity: opts.identity })
+        // KEEL-45: the names the socket is reached at, when there are any
+        // beyond its loopback ones (else plexus-transport's default stands).
+        let hosts = if opts.public_url.is_some() || !opts.allowed_hosts.is_empty() {
+            let mut hosts = socket_hosts(opts.ws_port, opts.public_url.as_deref());
+            for h in &opts.allowed_hosts {
+                if !hosts.contains(h) {
+                    hosts.push(h.clone());
+                }
+            }
+            hosts
+        } else {
+            Vec::new()
+        };
+        Ok(Wired {
+            sessions,
+            login,
+            backend,
+            gate,
+            protected,
+            origins,
+            hosts,
+            trusted_proxies: opts.trusted_proxies,
+            public_url,
+            providers: opts.providers,
+            access,
+            identity: opts.identity,
+        })
     }
 }
 
@@ -359,6 +391,12 @@ pub struct Wired<A: LoginAccess> {
     pub protected: ProtectedResource,
     /// The origins whose pages may open the socket.
     pub origins: Vec<String>,
+    /// KEEL-45: the `Host` names the socket answers to — empty when only
+    /// its loopback names, which is plexus-transport's default.
+    pub hosts: Vec<String>,
+    /// KEEL-45: the proxies whose forwarded headers are believed — the
+    /// page's and the socket's alike ([`Wired::apply`]).
+    pub trusted_proxies: TrustedProxies,
     /// Where people reach the shell.
     pub public_url: String,
     /// Every provider, the agents' key proof included.
@@ -419,14 +457,26 @@ impl<A: LoginAccess> Wired<A> {
     }
 
     /// The upgrade's half on a transport builder that has its WebSocket:
-    /// the allowed origins, and with login on the gate, the anonymous view
+    /// the allowed origins; the `Host` names it answers to, when there are
+    /// more than its loopback ones (KEEL-45: plexus-transport 0.10.1 answers
+    /// only those by default, so behind a public URL the socket names it —
+    /// call this after any `with_allowed_hosts` of your own, or put yours in
+    /// [`LoginOptions::allowed_hosts`]); the trusted proxies, when any were
+    /// said (the socket's quotas and its own origin read them); and with
+    /// login on the gate, the anonymous view
     /// (AUTH-6/AUTH-7: no credential → only the auth door; a credential
     /// presented and refused → 401 with RFC 6750's challenge), the
     /// `access_token` cookie as the one credential cookie (a stale session
     /// cookie falls into the anonymous view, never a 401 a page cannot
     /// read), and the protected resource.
     pub fn apply<H: Activation>(&self, builder: TransportServerBuilder<H>) -> TransportServerBuilder<H> {
-        let builder = builder.with_allowed_origins(self.origins.clone());
+        let mut builder = builder.with_allowed_origins(self.origins.clone());
+        if !self.hosts.is_empty() {
+            builder = builder.with_allowed_hosts(self.hosts.clone());
+        }
+        if self.trusted_proxies.configured() {
+            builder = builder.with_trusted_proxies(self.trusted_proxies.clone());
+        }
         match &self.gate {
             Some(gate) => builder
                 .with_session_validator(gate.clone())
@@ -470,14 +520,35 @@ pub fn resource_url(ws_port: u16, public_url: Option<&str>) -> String {
 }
 
 /// The origins a shell on `shell_port` is reached at: `127.0.0.1`,
-/// `localhost`, and `public_url`'s.
+/// `localhost` (plexus-transport's loopback names, as `http://` origins),
+/// and `public_url`'s.
 pub fn shell_origins(shell_port: u16, public_url: &str) -> Vec<String> {
-    let mut origins = vec![format!("http://127.0.0.1:{shell_port}"), format!("http://localhost:{shell_port}")];
+    let mut origins: Vec<String> = loopback_hosts(shell_port).into_iter().map(|h| format!("http://{h}")).collect();
     let origin = origin_of(public_url);
     if !origins.contains(&origin) {
         origins.push(origin);
     }
     origins
+}
+
+/// KEEL-45: the `Host` names a socket on `ws_port` is reached at — the
+/// authorities of [`login::socket_urls`] (the same list a key proof's
+/// audiences come from): the loopback names for the port and, with a public
+/// URL, its host as a browser names it (`toy.example`, `toy.example:8443`).
+pub fn socket_hosts(ws_port: u16, public_url: Option<&str>) -> Vec<String> {
+    let mut hosts = loopback_hosts(ws_port);
+    for u in login::socket_urls(ws_port, public_url) {
+        let Ok(u) = url::Url::parse(&u) else { continue };
+        let Some(host) = u.host_str() else { continue };
+        let named = match u.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host.to_string(),
+        };
+        if !hosts.contains(&named) {
+            hosts.push(named);
+        }
+    }
+    hosts
 }
 
 #[cfg(test)]
@@ -495,6 +566,7 @@ mod tests {
         let wired = w.finish(TestAccess, None).unwrap();
         assert!(wired.login.is_none() && wired.gate.is_none() && wired.router().is_none() && wired.metadata_url().is_none());
         assert_eq!(wired.origins, ["http://127.0.0.1:4591", "http://localhost:4591"]);
+        assert!(wired.hosts.is_empty(), "no public URL: plexus-transport's loopback default stands");
     }
 
     #[test]
@@ -511,6 +583,22 @@ mod tests {
         assert_eq!(wired.metadata_url().as_deref(), Some("https://toy.example/.well-known/oauth-protected-resource/ws"));
         assert!(wired.metadata_route().is_some());
         assert_eq!(wired.origins, ["http://127.0.0.1:4591", "http://localhost:4591", "https://toy.example", "https://other.example"]);
+        // KEEL-45: behind the public URL the socket answers its name too.
+        assert_eq!(wired.hosts, ["127.0.0.1:4590", "localhost:4590", "toy.example"]);
+    }
+
+    /// KEEL-45: the names a socket answers to are its loopback ones and the
+    /// public URL's host as a browser sends it; more are added, never `*`
+    /// by this crate.
+    #[test]
+    fn the_socket_answers_its_loopback_names_and_its_public_name() {
+        assert_eq!(socket_hosts(4590, None), ["127.0.0.1:4590", "localhost:4590"]);
+        assert_eq!(socket_hosts(4590, Some("https://Toy.Example:8443/app")), ["127.0.0.1:4590", "localhost:4590", "toy.example:8443"]);
+        assert_eq!(socket_hosts(4590, Some("http://menger.lan:4591/")), ["127.0.0.1:4590", "localhost:4590", "menger.lan:4591"]);
+        assert_eq!(socket_hosts(4590, Some("http://127.0.0.1:4591")), ["127.0.0.1:4590", "localhost:4590", "127.0.0.1:4591"]);
+        let opts = LoginOptions { allowed_hosts: vec!["toy.lan:4590".into()], ..LoginOptions::new(BRAND, 4590, 4591) };
+        let wired = Wiring::new(opts).unwrap().finish(TestAccess, None).unwrap();
+        assert_eq!(wired.hosts, ["127.0.0.1:4590", "localhost:4590", "toy.lan:4590"]);
     }
 
     #[test]
