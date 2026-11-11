@@ -722,6 +722,23 @@ impl Sessions {
         self.session_of(headers)?.principal()
     }
 
+    /// GAMMA-11: whether `principal` (as the gate writes it) has a browser
+    /// session standing now — one a browser signed in to
+    /// ([`Sessions::create`]), before its expiry, not gone idle, and with no
+    /// ceiling: what [`Sessions::session_of`] would answer for it. A minted
+    /// agent token ([`Sessions::mint`]) is never one. Nothing is marked used.
+    pub fn has_browser(&self, principal: &str) -> bool {
+        let t = now();
+        let mut live = self.live.lock().unwrap();
+        live.purge(t);
+        live.map.values().any(|(s, _, _)| {
+            s.idles
+                && !(self.idle_secs > 0 && t - s.seen > self.idle_secs)
+                && s.ctx.metadata.get(plexus_rpc::core::plexus::CEILING_KEY).is_none()
+                && s.ctx.principal().is_some_and(|p| p.to_string() == principal)
+        })
+    }
+
     /// Ends a session (sign-out). Its sockets stop answering on their next
     /// call ([`Sessions::alive`]).
     pub fn end(&self, id: &str) {
@@ -955,6 +972,33 @@ mod tests {
         assert!(s.principal_of(&with(&format!("{name}x={id}"))).is_none() && s.principal_of(&HeaderMap::new()).is_none());
         s.end(&id);
         assert!(s.session_of(&h).is_none() && s.principal_of(&h).is_none(), "signed out");
+    }
+
+    /// GAMMA-11: whether a principal has a browser session standing — only
+    /// one a browser signed in to ([`Sessions::create`]); never a minted
+    /// agent token, one with a ceiling, one ended, expired or gone idle.
+    #[test]
+    fn a_principal_has_a_browser_only_while_a_browser_session_of_its_stands() {
+        let s = Sessions::new(3600, &names()).with_idle(60);
+        let as_ = |p: &str| AuthContext::new("u".into(), "sid".into(), vec![], json!({ "principal": p }));
+        let (alice_id, _) = s.create(as_("idp:11111111-1111-4111-8111-111111111111")).unwrap();
+        let _ = s.mint(as_("idp:22222222-2222-4222-8222-222222222222"), 3600).unwrap();
+        let mut capped = as_("idp:33333333-3333-4333-8333-333333333333");
+        capped.metadata.as_object_mut().unwrap().insert(plexus_rpc::core::plexus::CEILING_KEY.into(), json!(["viewer@*"]));
+        let _ = s.create(capped).unwrap();
+        assert!(s.has_browser("idp:11111111-1111-4111-8111-111111111111"), "a browser signed in");
+        assert!(!s.has_browser("idp:22222222-2222-4222-8222-222222222222"), "a minted agent token is no browser");
+        assert!(!s.has_browser("idp:33333333-3333-4333-8333-333333333333"), "a session with a ceiling is no browser");
+        assert!(!s.has_browser("idp:44444444-4444-4444-8444-444444444444"), "nobody signed in");
+        let (idle_id, _) = s.create(as_("idp:55555555-5555-4555-8555-555555555555")).unwrap();
+        let key = s.get(&idle_id).unwrap().metadata["menger_session"].as_str().unwrap().to_string();
+        s.live.lock().unwrap().get_mut(&key).unwrap().seen -= 3000;
+        assert!(!s.has_browser("idp:55555555-5555-4555-8555-555555555555"), "gone idle");
+        s.end(&alice_id);
+        assert!(!s.has_browser("idp:11111111-1111-4111-8111-111111111111"), "signed out");
+        let expired = Sessions::new(-1, &names());
+        let _ = expired.create(as_("idp:11111111-1111-4111-8111-111111111111")).unwrap();
+        assert!(!expired.has_browser("idp:11111111-1111-4111-8111-111111111111"), "expired");
     }
 
     /// KEEL-45 (review F2): every reader of a cookie — the gate's, the
