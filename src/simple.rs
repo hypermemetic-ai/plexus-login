@@ -330,7 +330,8 @@ impl LoginAccess for SimpleAccess {
 
     fn logout(&self, caller: Option<&AuthContext>) -> Result<(), String> {
         let key = caller.and_then(|c| c.get_metadata_string(self.0.sessions.session_key())).ok_or("this connection holds no session to log out")?;
-        self.0.sessions.end_key(&key);
+        // GAMMA-15 review (Low): a sign-out that cannot be kept says so.
+        self.0.sessions.end_key_kept(&key).map_err(|e| format!("signed out here, but the sign-out could not be kept ({e}): the session may stand again after a restart"))?;
         Ok(())
     }
 

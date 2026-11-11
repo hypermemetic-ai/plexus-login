@@ -271,7 +271,9 @@ struct FileSink {
 fn open_0600(path: &Path, fresh: bool) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut o = std::fs::OpenOptions::new();
-    o.read(true).append(true).mode(0o600);
+    // GAMMA-15 review F1: never through a symlink — the journal, its lock
+    // and its `.new` alike.
+    o.read(true).append(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     if fresh {
         o.create_new(true);
     } else {
@@ -305,7 +307,7 @@ impl FileSink {
             std::fs::TryLockError::Error(e) => io::Error::new(e.kind(), format!("cannot lock {}: {e}", lock_path.display())),
         })?;
         let mut file = open_0600(path, false).map_err(ctx)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(ctx)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(ctx)?;
         let mut held = Vec::new();
         file.read_to_end(&mut held).map_err(ctx)?;
         Ok((Self { path: path.to_path_buf(), file, _lock: lock }, held))
@@ -407,6 +409,26 @@ impl Sessions {
         Ok(me)
     }
 
+    /// GAMMA-15 (review F2): whether a live table holds the journal at
+    /// `path` — its lock (`<path>.lock`, opened never through a symlink)
+    /// taken by another. A command run beside a server asks this to know
+    /// the server is up on that journal, rather than trusting a file it
+    /// left. Asking takes the lock for an instant when it is free.
+    pub fn journal_held(path: impl AsRef<Path>) -> io::Result<bool> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let lock = with_suffix(path.as_ref(), ".lock");
+        let f = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&lock) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", lock.display()))),
+        };
+        match f.try_lock_shared() {
+            Ok(()) => Ok(false),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
     /// The rows in `held`, in order, into the table: a start that has not
     /// ended, a use, an end. A line that is not a row (a torn last write)
     /// is skipped.
@@ -496,15 +518,20 @@ impl Sessions {
     /// Records sessions that ended — already out of `live`. An ending is
     /// never undone, so a row that cannot be written is logged.
     fn record_ends(&self, keys: Vec<String>) {
-        if keys.is_empty() {
-            return;
-        }
-        let mut journal = self.journal.lock().unwrap();
-        let Some(j) = journal.as_mut() else { return };
-        let rows: Vec<Row> = keys.into_iter().map(|key| Row::End { key }).collect();
-        if let Err(e) = self.append(j, &rows, true) {
+        if let Err(e) = self.write_ends(keys) {
             tracing::error!("a session's end could not be written to the journal (it may stand again after a restart): {e}");
         }
+    }
+
+    /// Writes an `End` row per key, durably; an error when it cannot.
+    fn write_ends(&self, keys: Vec<String>) -> io::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut journal = self.journal.lock().unwrap();
+        let Some(j) = journal.as_mut() else { return Ok(()) };
+        let rows: Vec<Row> = keys.into_iter().map(|key| Row::End { key }).collect();
+        self.append(j, &rows, true)
     }
 
     /// How often a browser's use is written: an eighth of its idle time, at
@@ -708,6 +735,21 @@ impl Sessions {
         let Some((_, ends)) = removed else { return false };
         self.record_ends(vec![key.to_string()]);
         ends > now()
+    }
+
+    /// GAMMA-15 (review, Low): [`Sessions::end_key`] for a sign-out, which
+    /// fails loudly when its end cannot be kept: the session is ended here
+    /// all the same, but an `Err` says it may stand again after a restart.
+    pub fn end_key_kept(&self, key: &str) -> io::Result<bool> {
+        let removed = self.live.lock().unwrap().remove(key);
+        let Some((_, ends)) = removed else { return Ok(false) };
+        self.write_ends(vec![key.to_string()])?;
+        Ok(ends > now())
+    }
+
+    /// [`Sessions::end`] as [`Sessions::end_key_kept`].
+    pub fn end_kept(&self, id: &str) -> io::Result<bool> {
+        self.end_key_kept(&hash(id))
     }
 
     /// Whether the session a connection's identity names still stands.
@@ -1103,6 +1145,77 @@ mod tests {
         let s = Sessions::open(&path, 3600, &names()).unwrap();
         assert!(s.get(&ids[0]).is_none() && s.get(&ids[1]).is_none(), "the two the cap pushed out stay out");
         assert!(ids[2..].iter().all(|id| s.get(id).is_some()), "the three it kept stand");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// GAMMA-15 review F1: the journal, its lock and its `.new` are never
+    /// opened through a symlink — a symlink planted at any of them is
+    /// refused, and its target is left untouched (neither written nor
+    /// chmodded).
+    #[test]
+    fn a_symlink_at_the_journal_is_refused_and_its_target_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        for planted in ["sessions.jsonl", "sessions.jsonl.lock"] {
+            let dir = std::env::temp_dir().join(format!("plexus-login-link-{}-{}", std::process::id(), random_token()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("target");
+            std::fs::write(&target, b"theirs").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::os::unix::fs::symlink(&target, dir.join(planted)).unwrap();
+            assert!(Sessions::open(dir.join("sessions.jsonl"), 3600, &names()).is_err(), "a symlink at {planted} is refused");
+            assert_eq!(std::fs::read(&target).unwrap(), b"theirs", "{planted}: its target unwritten");
+            assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644, "{planted}: and unchmodded");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let dir = std::env::temp_dir().join(format!("plexus-login-new-{}-{}", std::process::id(), random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Sessions::open(dir.join("sessions.jsonl"), 3600, &names()).unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, b"theirs").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("sessions.jsonl.new")).unwrap();
+        s.compact().expect("a compaction replaces a planted .new, never writes through it");
+        assert_eq!(std::fs::read(&target).unwrap(), b"theirs", ".new: its target unwritten");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// GAMMA-15 review (Low): a sign-out whose end cannot be written fails
+    /// loudly — ended here, and the caller told it may stand again.
+    #[test]
+    fn a_sign_out_whose_end_cannot_be_kept_fails_loudly() {
+        struct Fails(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Sink for Fails {
+            fn append(&mut self, _: &[u8], _: bool) -> io::Result<()> {
+                match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    true => Err(io::Error::other("the disk is full")),
+                    false => Ok(()),
+                }
+            }
+            fn rewrite(&mut self, _: &[u8]) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let full = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = Sessions::new(3600, &names()).with_sink(Box::new(Fails(full.clone())));
+        let (id, _) = s.create(alice()).unwrap();
+        full.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = s.end_kept(&id).expect_err("the end could not be kept: said");
+        assert!(err.to_string().contains("disk is full"), "{err}");
+        assert!(s.get(&id).is_none(), "ended here all the same");
+        assert!(!s.end_kept(&id).unwrap(), "and only once");
+    }
+
+    /// GAMMA-15 review F2: a journal is held while its table lives, and
+    /// free once it is gone (or never was).
+    #[test]
+    fn a_journal_is_held_while_its_table_lives() {
+        let dir = std::env::temp_dir().join(format!("plexus-login-held-{}-{}", std::process::id(), random_token()));
+        let path = dir.join("sessions.jsonl");
+        assert!(!Sessions::journal_held(&path).unwrap(), "no journal: not held");
+        let table = Sessions::open(&path, 3600, &names()).unwrap();
+        assert!(Sessions::journal_held(&path).unwrap(), "held while the table lives");
+        drop(table);
+        assert!(!Sessions::journal_held(&path).unwrap(), "free once it is gone");
+        assert!(Sessions::open(&path, 3600, &names()).is_ok(), "and asking left it free");
         let _ = std::fs::remove_dir_all(dir);
     }
 
