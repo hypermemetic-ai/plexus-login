@@ -1160,8 +1160,11 @@ pub async fn logout<A: LoginAccess>(State(login): State<Arc<Login<A>>>, headers:
         if let Some(key) = ctx.get_metadata_string(login.sessions.session_key()).filter(|_| ctx.get_metadata_string("identity_backend").is_some()) {
             // AUTH-24 #5: the session ends first, here and now; the backend
             // is told after, off the request, with retries.
-            login.sessions.end_key(&key);
+            let kept = login.sessions.end_key_kept(&key);
             tokens.revoke_later(&key);
+            if let Err(e) = kept {
+                return unkept_sign_out(&login, e);
+            }
             let to = login.return_to.allowed(form.next.as_deref()).unwrap_or_else(|| "/login".into());
             let mut r = see_other(&to);
             r.headers_mut().append(
@@ -1179,7 +1182,9 @@ pub async fn logout<A: LoginAccess>(State(login): State<Arc<Login<A>>>, headers:
     });
     let name = login.sessions.cookie_name();
     if let Some(id) = login.sessions.id_of(&headers) {
-        login.sessions.end(id);
+        if let Err(e) = login.sessions.end_kept(id) {
+            return unkept_sign_out(&login, e);
+        }
     }
     let mut r = match onward {
         Some(url) => (StatusCode::SEE_OTHER, [(header::LOCATION, url), (header::CACHE_CONTROL, "no-store".to_string())]).into_response(),
@@ -1188,6 +1193,19 @@ pub async fn logout<A: LoginAccess>(State(login): State<Arc<Login<A>>>, headers:
     r.headers_mut().append(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!("{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}", login.secure())).unwrap(),
+    );
+    r
+}
+
+/// GAMMA-15 review (Low): a sign-out whose end could not be written —
+/// ended here, the cookie cleared, and said loudly (500), since the session
+/// may stand again after a restart.
+fn unkept_sign_out<A: LoginAccess>(login: &Login<A>, e: std::io::Error) -> Response {
+    tracing::error!("a sign-out could not be written to the sessions journal (it may stand again after a restart): {e}");
+    let mut r = (StatusCode::INTERNAL_SERVER_ERROR, [(header::CACHE_CONTROL, "no-store")], "Signed out here, but the sign-out could not be kept: the session may stand again after a restart. Sign out again, or tell the operator.").into_response();
+    r.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!("{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}", login.sessions.cookie_name(), login.secure())).unwrap(),
     );
     r
 }

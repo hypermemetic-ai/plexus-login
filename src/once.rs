@@ -46,44 +46,173 @@ pub const ONCE_SECS: i64 = 10 * 60;
 /// removing its file, which succeeds once: of two at once, one signs in.
 /// The token itself is never written; a file names only its hash.
 ///
+/// The directory is verified once, on the handle [`LinkDir::open`] keeps,
+/// and every file is reached through that handle (`openat`, `unlinkat`,
+/// no-follow): a directory renamed away and replaced afterwards is never
+/// read.
+///
 /// Who may mint is whoever may write the directory: the operator, the OS
 /// user the server runs as.
 #[derive(Debug, Clone)]
 pub struct LinkDir {
     dir: PathBuf,
+    fd: std::sync::Arc<std::fs::File>,
+}
+
+/// The effective user.
+fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+fn refusal(dir: &Path, why: &str, what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, format!("{}: {why}; {what}", dir.display()))
+}
+
+/// `dir` opened as a directory, never through a symlink, made (0700, with
+/// any missing parents) when missing; its metadata read from the handle.
+fn open_dir(dir: &Path) -> io::Result<(std::fs::File, std::fs::Metadata)> {
+    let ctx = |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", dir.display()));
+    match dir.symlink_metadata() {
+        Ok(m) if m.file_type().is_symlink() => return Err(refusal(dir, "a symlink", "give the directory itself")),
+        Ok(m) if !m.is_dir() => return Err(refusal(dir, "not a directory", "give a directory")),
+        Ok(_) => {}
+        Err(_) => std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(ctx)?,
+    }
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(dir).map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::ENOTDIR) {
+            refusal(dir, "a symlink or not a directory", "give the directory itself")
+        } else {
+            ctx(e)
+        }
+    })?;
+    let meta = f.metadata().map_err(ctx)?;
+    Ok((f, meta))
+}
+
+/// GAMMA-15 (review F1): `dir` as a server's private data directory —
+/// made 0700 when missing; refused when it is a symlink, not a directory,
+/// another user's, or writable by its group or others (naming the fix: it
+/// is never changed silently). Whatever is kept inside is only as safe as
+/// this: whoever may write it may plant a session, a link, or a file the
+/// server reads.
+pub fn private_dir(dir: impl AsRef<Path>) -> io::Result<()> {
+    let dir = dir.as_ref();
+    let (_, meta) = open_dir(dir)?;
+    if meta.uid() != euid() {
+        return Err(refusal(dir, "another user's", "a data directory must be the server's own"));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(refusal(dir, &format!("writable by its group or others (mode {:o})", meta.mode() & 0o777), &format!("whoever may write it may sign in; `chmod go-w {}` (or 0700) and start again", dir.display())));
+    }
+    Ok(())
+}
+
+/// GAMMA-15 (review F1): the bytes of `path` (at most `max`), read only
+/// when it is a regular file of the effective user's that its group and
+/// others cannot write — never through a symlink, never blocking on a FIFO.
+pub fn read_private(path: impl AsRef<Path>, max: u64) -> io::Result<Vec<u8>> {
+    let path = path.as_ref();
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() || meta.uid() != euid() || meta.mode() & 0o022 != 0 {
+        return Err(refusal(path, "not a private file of this user's", "it is not read"));
+    }
+    let mut bytes = Vec::new();
+    f.take(max).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 impl LinkDir {
     /// The links in `dir`, made (0700) when missing. Refused when `dir` is
-    /// a symlink, not a directory, or another user's; one that is open to
-    /// others is closed to 0700.
+    /// a symlink, not a directory, another user's, or writable by its group
+    /// or others; one others may only read is closed to 0700.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref();
-        let ctx = |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", dir.display()));
-        if dir.symlink_metadata().is_err() {
-            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(ctx)?;
+        let what = "the one-time links are kept only in a directory of the server's own";
+        let (fd, meta) = open_dir(dir).map_err(|e| io::Error::new(e.kind(), format!("{e}; {what}")))?;
+        if meta.uid() != euid() {
+            return Err(refusal(dir, "another user's", what));
         }
-        let meta = dir.symlink_metadata().map_err(ctx)?;
-        let refuse = |why: &str| io::Error::new(io::ErrorKind::PermissionDenied, format!("{}: {why}; the one-time links are kept only in a directory of the server's own", dir.display()));
-        if meta.file_type().is_symlink() {
-            return Err(refuse("a symlink"));
-        }
-        if !meta.is_dir() {
-            return Err(refuse("not a directory"));
-        }
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        if meta.uid() != unsafe { libc::geteuid() } {
-            return Err(refuse("another user's"));
+        if meta.mode() & 0o022 != 0 {
+            return Err(refusal(dir, "writable by its group or others", &format!("{what}: `chmod 700 {}`", dir.display())));
         }
         if meta.mode() & 0o077 != 0 {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(ctx)?;
+            fd.set_permissions(std::fs::Permissions::from_mode(0o700))?;
         }
-        Ok(Self { dir: dir.to_path_buf() })
+        Ok(Self { dir: dir.to_path_buf(), fd: std::sync::Arc::new(fd) })
     }
 
-    /// The directory.
+    /// The directory (as it was named when opened).
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// `name` in the verified directory, opened with `flags`, never through
+    /// a symlink.
+    fn open_at(&self, name: &str, flags: libc::c_int) -> io::Result<std::fs::File> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let c = std::ffi::CString::new(name).map_err(io::Error::other)?;
+        // SAFETY: a valid directory fd, a NUL-terminated name; the fd
+        // returned is owned by the File.
+        let fd = unsafe { libc::openat(self.fd.as_raw_fd(), c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600 as libc::c_uint) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    /// Removes `name` from the verified directory.
+    fn unlink_at(&self, name: &str) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let c = std::ffi::CString::new(name).map_err(io::Error::other)?;
+        // SAFETY: a valid directory fd and a NUL-terminated name.
+        if unsafe { libc::unlinkat(self.fd.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The names in the verified directory.
+    fn names(&self) -> Vec<String> {
+        use std::os::fd::AsRawFd;
+        let mut out = Vec::new();
+        // SAFETY: a dup of a valid directory fd, handed to fdopendir, which
+        // owns it until closedir; each entry read before the next readdir.
+        unsafe {
+            let fd = libc::dup(self.fd.as_raw_fd());
+            if fd < 0 {
+                return out;
+            }
+            let d = libc::fdopendir(fd);
+            if d.is_null() {
+                libc::close(fd);
+                return out;
+            }
+            libc::rewinddir(d);
+            loop {
+                let e = libc::readdir(d);
+                if e.is_null() {
+                    break;
+                }
+                if let Ok(n) = std::ffi::CStr::from_ptr((*e).d_name.as_ptr()).to_str() {
+                    out.push(n.to_string());
+                }
+            }
+            libc::closedir(d);
+        }
+        out
+    }
+
+    /// The expiry `name` holds, read only from a regular file.
+    fn expiry(&self, name: &str) -> Option<i64> {
+        let f = self.open_at(name, libc::O_RDONLY | libc::O_NONBLOCK).ok()?;
+        if !f.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut text = String::new();
+        f.take(32).read_to_string(&mut text).ok()?;
+        text.trim().parse().ok()
     }
 
     /// A fresh token, good once for [`ONCE_SECS`]: 32 random bytes, hex.
@@ -98,12 +227,7 @@ impl LinkDir {
         let mut bytes = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(self.dir.join(hash(&token)))?;
+        let mut f = self.open_at(&hash(&token), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
         write!(f, "{}", at + ONCE_SECS)?;
         f.sync_all()?;
         Ok(token)
@@ -120,26 +244,20 @@ impl LinkDir {
         if token.is_empty() || token.len() > 128 {
             return false;
         }
-        let file = self.dir.join(hash(token));
-        let Ok(f) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&file) else { return false };
-        let mut text = String::new();
-        if f.take(32).read_to_string(&mut text).is_err() {
-            return false;
-        }
+        let name = hash(token);
+        let expires = self.expiry(&name);
         // Taking it is removing it: of two at once, one succeeds.
-        if std::fs::remove_file(&file).is_err() {
+        if self.unlink_at(&name).is_err() {
             return false;
         }
-        text.trim().parse::<i64>().is_ok_and(|expires| expires > at)
+        expires.is_some_and(|e| e > at)
     }
 
     /// Removes every file whose expiry has passed (or does not read).
     fn clear_expired(&self, at: i64) {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else { return };
-        for e in entries.flatten() {
-            let stale = std::fs::read_to_string(e.path()).ok().and_then(|s| s.trim().parse::<i64>().ok()).is_none_or(|exp| exp <= at);
-            if stale {
-                let _ = std::fs::remove_file(e.path());
+        for name in self.names().into_iter().filter(|n| n != "." && n != "..") {
+            if self.expiry(&name).is_none_or(|exp| exp <= at) {
+                let _ = self.unlink_at(&name);
             }
         }
     }
@@ -213,5 +331,71 @@ mod tests {
         let token = "cd".repeat(32);
         std::os::unix::fs::symlink(&target, elsewhere.join(hash(&token))).unwrap();
         assert!(!links.take(&token), "a token whose file is a symlink signs no one in");
+    }
+
+    /// GAMMA-15 review F1: the directory is verified once, on the handle
+    /// kept — a `once/` renamed away and replaced by another, with a
+    /// planted hash in it, signs no one in; nor is a token planted in a
+    /// `once/` its group or others may write ever taken.
+    #[test]
+    fn a_swapped_once_dir_with_a_planted_hash_signs_no_one_in() {
+        let root = scratch();
+        let links = LinkDir::open(root.join("once")).unwrap();
+        let real = links.mint().unwrap();
+        std::fs::rename(root.join("once"), root.join("once.old")).unwrap();
+        std::fs::DirBuilder::new().mode(0o700).create(root.join("once")).unwrap();
+        let planted = "ef".repeat(32);
+        std::fs::write(root.join("once").join(hash(&planted)), (crate::sessions::now() + 3600).to_string()).unwrap();
+        assert!(!links.take(&planted), "the replaced directory is never read");
+        assert!(root.join("once").join(hash(&planted)).exists(), "nor touched");
+        assert!(links.take(&real), "the verified one still is");
+
+        let open = root.join("open");
+        std::fs::DirBuilder::new().mode(0o777).create(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let e = LinkDir::open(&open).unwrap_err().to_string();
+        assert!(e.contains("writable by its group or others"), "{e}");
+        assert_eq!(std::fs::metadata(&open).unwrap().mode() & 0o777, 0o777, "refused, never changed silently");
+    }
+
+    /// GAMMA-15 review F1: a data directory is the server's own — made
+    /// 0700; a symlink, a file, or one its group or others may write is
+    /// refused, naming the fix, and left as it was.
+    #[test]
+    fn a_data_dir_others_can_write_is_refused() {
+        let root = scratch();
+        private_dir(root.join("new/data")).unwrap();
+        assert_eq!(std::fs::metadata(root.join("new/data")).unwrap().mode() & 0o777, 0o700, "made 0700");
+        let world = root.join("world");
+        std::fs::create_dir(&world).unwrap();
+        std::fs::set_permissions(&world, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let e = private_dir(&world).unwrap_err().to_string();
+        assert!(e.contains("writable by its group or others") && e.contains("chmod go-w"), "{e}");
+        assert_eq!(std::fs::metadata(&world).unwrap().mode() & 0o777, 0o777, "never chmodded silently");
+        std::fs::set_permissions(&world, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_dir(&world).expect("0755, the user's own: taken");
+        std::os::unix::fs::symlink(&world, root.join("link")).unwrap();
+        assert!(private_dir(root.join("link")).unwrap_err().to_string().contains("symlink"));
+        std::fs::write(root.join("file"), b"").unwrap();
+        assert!(private_dir(root.join("file")).unwrap_err().to_string().contains("not a directory"));
+    }
+
+    /// GAMMA-15 review F1: a private file is read only when it is a regular
+    /// file of this user's that no one else may write — never a symlink's
+    /// target, never a FIFO (which would block).
+    #[test]
+    fn a_private_file_is_read_only_when_private() {
+        let root = scratch();
+        let ok = root.join("ok");
+        std::fs::write(&ok, b"yes").unwrap();
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_private(&ok, 64).unwrap(), b"yes");
+        std::os::unix::fs::symlink(&ok, root.join("link")).unwrap();
+        assert!(read_private(root.join("link"), 64).is_err(), "not through a symlink");
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read_private(&ok, 64).is_err(), "not one others may write");
+        let fifo = std::ffi::CString::new(root.join("fifo").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(read_private(root.join("fifo"), 64).is_err(), "not a FIFO, and without blocking");
     }
 }

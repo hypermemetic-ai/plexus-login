@@ -28,9 +28,32 @@ passed on 0.11 before anything below.
   (`menger login`) lifted, so a server and a command run beside it share
   links with no method on the wire; an app's `OnceLinks` wraps it with whom
   the link signs in and its page's words. plexus-ui's `serve` and `login`
-  take it. A new dependency, `libc` (`O_NOFOLLOW`, `geteuid`).
+  take it. A new dependency, `libc` (`O_NOFOLLOW`, `geteuid`). The
+  directory is verified once, on the handle it keeps, and every file is
+  reached through it (`openat`/`unlinkat`, no-follow, a regular file only),
+  so a directory renamed away and replaced is never read; one its group or
+  others may write is refused, never chmodded.
+- **`once::private_dir`, `once::read_private`** (GAMMA-15's review, F1): a
+  server's data directory checked before anything inside is opened — made
+  0700, else refused when a symlink, another user's or writable by group or
+  others, naming the fix — and a file read only when it is a regular file of
+  the user's that no one else may write.
+- **`Sessions::journal_held(path)`** (F2): whether a live table holds the
+  journal's lock — how a command beside a server knows it is up.
+- **`Sessions::end_key_kept` / `end_kept`**: a sign-out that fails loudly
+  when its `End` row cannot be written. `SimpleAccess::logout` (`auth.logout`)
+  and the shell's `/logout` take them: the session ends here all the same,
+  and the caller is told (an error; a 500 with the cookie cleared) that it
+  may stand again after a restart, where before it was only logged.
+  `end_key` / `end` are unchanged.
 
 ### Changed
+
+- **The session journal, its `.lock` and its `.new` are never opened
+  through a symlink** (GAMMA-15's review, F1): a symlink planted at any of
+  them is refused at open, its target neither written nor chmodded (the
+  journal's mode is set on the open file, not the path). Otherwise the
+  journal behaves as before.
 
 - **`Wired::apply` takes plexus-transport 0.10.1's front door as it is,
   and names what only this crate knows.** The socket refuses a page from
