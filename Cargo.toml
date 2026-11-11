@@ -43,6 +43,9 @@ url = "2"
 rand = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
+# GAMMA-15: once::LinkDir opens its files O_NOFOLLOW and checks its
+# directory is the server's own (geteuid).
+libc = "0.2"
 # The dev sign-in registers accounts at plexus-idp over its Plexus socket.
 jsonrpsee = { version = "0.26", features = ["ws-client"] }
 async-trait = "0.1"

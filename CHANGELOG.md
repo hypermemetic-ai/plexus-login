@@ -16,6 +16,20 @@ plexus-core's and plexus-transport's types are in this crate's API
 `TrustedProxies`). The move itself needed no source change: every test
 passed on 0.11 before anything below.
 
+### Added
+
+- **`once::LinkDir`** (GAMMA-15): one-time sign-in tokens kept as files —
+  `<dir>/<sha256 of the token>`, each holding its expiry, 0600, in a
+  directory made 0700 and refused when it is a symlink, not a directory or
+  another user's; files opened `O_NOFOLLOW`. `mint` (32 random bytes, hex,
+  good for `once::ONCE_SECS`, ten minutes; the expired cleared on the way)
+  and `take` (true once, removing the file: of two at once, one wins), with
+  `mint_at` / `take_at` for a given time. It is menger's DIST-14 mechanism
+  (`menger login`) lifted, so a server and a command run beside it share
+  links with no method on the wire; an app's `OnceLinks` wraps it with whom
+  the link signs in and its page's words. plexus-ui's `serve` and `login`
+  take it. A new dependency, `libc` (`O_NOFOLLOW`, `geteuid`).
+
 ### Changed
 
 - **`Wired::apply` takes plexus-transport 0.10.1's front door as it is,
